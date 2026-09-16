@@ -120,16 +120,16 @@ test('API: publish, fan-out, idempotency, events, deliveries, test, replay, rede
   res = await app.inject({ method: 'POST', url: `/v1/subscriptions/${okSub.id}/replay`, headers: bearer(WRITE_KEY), payload: { from: '2026-09-17T09:00:00Z' } });
   assert.equal(res.statusCode, 202, res.body);
   assert.equal(json(res).queued, 1);
-  assert.equal(json(await app.inject({ method: 'POST', url: `/v1/subscriptions/${okSub.id}/replay`, headers: bearer(WRITE_KEY), payload: { from: 'yesterday' } })).error.code, 'INVALID_RANGE');
+  assert.equal(json(await app.inject({ method: 'POST', url: `/v1/subscriptions/${okSub.id}/replay`, headers: bearer(WRITE_KEY), payload: { from: 'yesterday-around-nine-oclock' } })).error.code, 'INVALID_RANGE');
 
   const stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
   assert.deepEqual(stats.subscriptions, { active: 2, paused: 0, disabled: 0 });
   assert.deepEqual(stats.events, { total: 2, last24h: 1 });
   assert.deepEqual([stats.deliveries.byStatus.succeeded, stats.deliveries.byStatus.cancelled, stats.deliveries.backlog.queued], [2, 1, 2]);
-  assert.deepEqual(stats.worker.sinceStart, { succeeded: 2, failed: 0, retried: 1, disabled: 0 });
+  assert.deepEqual(stats.worker.sinceStart, { succeeded: 2, failed: 0, retried: 2, disabled: 0 }, 'the redelivered copy hit /fail once more');
   const metrics = await app.inject({ url: '/metrics', headers: bearer(READ_KEY) });
   assert.match(metrics.body, /webhook_subscriptions\{status="active"\} 2\n/);
   assert.match(metrics.body, /webhook_deliveries\{status="succeeded"\} 2\n/);
   assert.match(metrics.body, /webhook_backlog 2\n/);
-  assert.match(metrics.body, /webhook_attempts_retried_total 1\n/);
+  assert.match(metrics.body, /webhook_attempts_retried_total 2\n/);
 });
