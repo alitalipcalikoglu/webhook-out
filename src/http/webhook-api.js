@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, jsonParser, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, jsonParser, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { WebhookError } from '../domain/errors.js';
 import { DeliveryStore } from '../store/delivery-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
@@ -38,10 +38,11 @@ export class WebhookApi {
    * @param {import('../store/heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {import('../worker.js').Worker|null} deps.worker
    * @param {import('../db.js').Database} deps.db
+   * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, presence, worker, db, logger }) {
+  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, presence, worker, db, version, logger }) {
     this.config = config;
     this.audit = audit;
     this.subs = subscriptionService;
@@ -52,6 +53,7 @@ export class WebhookApi {
     this.presence = presence;
     this.worker = worker;
     this.db = db;
+    this.version = version;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
   }
@@ -89,6 +91,12 @@ export class WebhookApi {
       reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: WebhookApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
+    registerInfo(app, {
+      service: 'webhook-out',
+      version: this.version,
+      capabilities: ['replay', 'rotate', 'test-delivery', 'redeliver'],
+      schemaVersion: this.db.schemaVersion,
+    });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;

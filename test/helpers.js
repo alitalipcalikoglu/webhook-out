@@ -81,7 +81,7 @@ export function testService(overrides) {
 /** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
 export async function buildApp(overrides, deps = {}) {
   const t = testService(overrides);
-  const app = await new WebhookApi({ ...t, ...deps, logger: silent }).build();
+  const app = await new WebhookApi({ ...t, version: '0.0.0-test', ...deps, logger: silent }).build();
   await app.ready();
   return { app, ...t };
 }

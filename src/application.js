@@ -2,6 +2,7 @@ import { Config } from './config.js';
 import { AuditClient } from '@atc-web/service-core/audit';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { ConsoleLogger } from '@atc-web/service-core/log';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { SecretBox } from './crypto/secret-box.js';
 import { Database } from './db.js';
 import { EventService } from './domain/event-service.js';
@@ -33,6 +34,7 @@ export class Application {
   constructor(config, { role = 'combined' } = {}) {
     this.config = config;
     this.role = role;
+    this.version = readServiceVersion(import.meta.url);
     this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.subscriptions = new SubscriptionStore(this.db);
@@ -86,7 +88,7 @@ export class Application {
     const steps = [];
 
     if (runsApi) {
-      const api = new WebhookApi({ config, audit: this.audit, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, presence: this.presence, worker: this.worker, db: this.db });
+      const api = new WebhookApi({ config, audit: this.audit, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, presence: this.presence, worker: this.worker, db: this.db, version: this.version });
       const app = await api.build();
       this.app = app;
       log = app.log;

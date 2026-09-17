@@ -43,6 +43,14 @@ npm run typecheck
 - **Operator tools**: test event, replay of a time window, redelivery of one delivery, cancel, secret rotation with a dual-signed grace period.
 - **Outbound safety**: `https://` only unless `TARGET_ALLOW_HTTP`; host allowlist; private and loopback addresses blocked unless `TARGET_ALLOW_PRIVATE` (which requires the allowlist); the resolved address is pinned; response capture bounded to 1 KiB.
 
+## Boundaries
+
+**Purpose:** durable, retryable delivery of business events to external subscriber URLs.
+
+**Responsibilities:** subscription management (secret rotation, pause/resume); event publish and fan-out; retry/backoff; replay; redeliver; test-delivery; delivery history.
+
+**Non-responsibilities:** webhook-out ≠ scheduler — it delivers events it's told about, it does not schedule recurring or time-based work. No cross-subscription ordering guarantee (one global concurrency pool, not per-subscription); no per-subscription in-flight cap today (documented gap, not yet built).
+
 ## API
 
 Errors are JSON: `{ "error": { "code", "message", "details?" } }`.

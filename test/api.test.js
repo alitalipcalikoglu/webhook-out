@@ -1,14 +1,22 @@
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PUBLISH_KEY, READ_KEY, RW_KEY, WRITE_KEY, bearer, buildApp, receiver } from './helpers.js';
 
 const json = (/** @type {import('light-my-request').Response} */ r) => JSON.parse(r.body);
+const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 test('API: probes, auth and roles', async (t) => {
-  const { app } = await buildApp();
+  const { app } = await buildApp(undefined, { version: pkgVersion });
   t.after(() => app.close());
   assert.equal((await app.inject({ url: '/health' })).statusCode, 200);
   assert.equal(json(await app.inject({ url: '/ready' })).worker, 'stopped');
+  const info = json(await app.inject({ url: '/v1/info' }));
+  assert.equal(typeof info.schemaVersion, 'number');
+  assert.equal(typeof info.serviceCore, 'string');
+  delete info.schemaVersion;
+  delete info.serviceCore;
+  assert.deepEqual(info, { service: 'webhook-out', version: pkgVersion, apiVersion: 'v1', capabilities: ['replay', 'rotate', 'test-delivery', 'redeliver'] });
   assert.equal((await app.inject({ url: '/v1/subscriptions' })).statusCode, 401);
   assert.equal((await app.inject({ url: '/v1/subscriptions', headers: bearer(WRITE_KEY) })).statusCode, 403, 'write-only key cannot list');
   assert.equal((await app.inject({ url: '/v1/subscriptions', headers: bearer(PUBLISH_KEY) })).statusCode, 403, 'publish key cannot list');
