@@ -8,6 +8,7 @@ Scenario-driven walkthroughs of every feature. Requests to `/v1/*` need `Authori
 | [Publishing events](publishing.md) | The publish call from your backends, idempotency keys, fan-out, what a 202 means |
 | [Receiving a webhook](receiving.md) | What the receiver sees, verifying the signature, handling duplicates, what counts as success |
 | [Retries and dead deliveries](retries.md) | The retry schedule, retryable versus permanent failures, cancel, redeliver |
+| [Ordering and per-subscription concurrency](ordering-and-concurrency.md) | Best-effort `ordered: true` delivery, the per-subscription concurrency cap |
 | [Automatic disable](disable.md) | Consecutive failures, the disabled state, resuming, catching up |
 | [Replaying events](replay.md) | Re-queueing a time window for one subscriber after downtime or a late subscription |
 | [Rotating a secret](rotation.md) | Dual-signed grace period, the receiver's steps |

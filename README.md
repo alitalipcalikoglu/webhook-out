@@ -43,13 +43,36 @@ npm run typecheck
 - **Operator tools**: test event, replay of a time window, redelivery of one delivery, cancel, secret rotation with a dual-signed grace period.
 - **Outbound safety**: `https://` only unless `TARGET_ALLOW_HTTP`; host allowlist; private and loopback addresses blocked unless `TARGET_ALLOW_PRIVATE` (which requires the allowlist); the resolved address is pinned; response capture bounded to 1 KiB.
 
+## Ordering and per-subscription concurrency
+
+`ordered: true` on a subscription (default `false`, backward compatible) makes its deliveries
+**best-effort ordered**: the worker never claims a later delivery for that subscription while an
+earlier one (by creation order — `deliveries.id`, a stable, collision-free autoincrement sequence,
+not a timestamp) is still `pending`, `running` or `retrying`. This holds even while the earlier
+delivery is sitting out its own retry backoff — a later, already-due delivery still waits for it.
+**This is not a global or exactly-once ordering guarantee**: it's ordering per subscription, best
+effort, enforced at claim time by the database itself (an atomic conditional query, not a
+process-local lock), correct across any number of worker processes sharing the database. An ordered
+subscription's effective in-flight cap is always 1, regardless of `SUBSCRIPTION_CONCURRENCY_MAX`.
+
+`SUBSCRIPTION_CONCURRENCY_MAX` (default `4`) bounds how many of one **unordered** subscription's
+deliveries may run at once, worker-wide — so one noisy or slow subscription with a huge backlog
+can't consume the whole worker's `WORKER_CONCURRENCY` and starve every other subscription's
+deliveries. This is a single global setting applied to every unordered subscription uniformly, not
+a per-subscription override; enforced the same way as ordering (an atomic claim query, correct
+across processes) — never a process-local `Set`/semaphore, which wouldn't hold across workers.
+
+Both are proven under real cross-connection concurrency (separate `node:worker_threads`, separate
+`DatabaseSync` connections to the same file, not simulated same-process interleaving) in
+`test/ordering-and-cap.test.js`.
+
 ## Boundaries
 
 **Purpose:** durable, retryable delivery of business events to external subscriber URLs.
 
 **Responsibilities:** subscription management (secret rotation, pause/resume); event publish and fan-out; retry/backoff; replay; redeliver; test-delivery; delivery history.
 
-**Non-responsibilities:** webhook-out ≠ scheduler — it delivers events it's told about, it does not schedule recurring or time-based work. No cross-subscription ordering guarantee (one global concurrency pool, not per-subscription); no per-subscription in-flight cap today (documented gap, not yet built).
+**Non-responsibilities:** webhook-out ≠ scheduler — it delivers events it's told about, it does not schedule recurring or time-based work. Still no cross-subscription ordering guarantee (deliveries for different subscriptions interleave freely, by design). Per-subscription ordering (`ordered: true`) and a per-subscription in-flight cap now exist — see "Ordering and per-subscription concurrency" below.
 
 ## API
 
@@ -58,7 +81,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/health`, `/ready`, `/v1/info` | none | Liveness; readiness (database, cached 10 s) with worker state; service identity (version, API version, capabilities, schema version, service-core version). |
-| POST | `/v1/subscriptions` | write | `{ name, url, events, description?, headers?, enabled? }` → `201 { subscription, secret }`. |
+| POST | `/v1/subscriptions` | write | `{ name, url, events, description?, headers?, enabled?, ordered? }` → `201 { subscription, secret }`. |
 | GET | `/v1/subscriptions` | read | Sorted by name; `q`, `status`, `event`, `limit` ≤ 200, `cursor`. |
 | GET / PATCH / DELETE | `/v1/subscriptions/:id` | read / write / write | Read; partial update incl. `enabled`; delete with its deliveries. |
 | POST | `/v1/subscriptions/:id/rotate` | write | New secret → `{ subscription, secret, previousValidUntil }`. |
@@ -154,7 +177,9 @@ the original worker cannot overwrite that outcome if it later finishes the call 
 This makes **multiple worker processes against the same `DB_PATH` a supported topology**: the
 commented-out split `webhook-out-worker` app in `ecosystem.config.cjs` can run with `instances` >
 1. Claiming is atomic across processes (`BEGIN IMMEDIATE` around the whole read-decide-write),
-proven with real cross-connection concurrency in `test/lease-concurrency.test.js`. Still one host,
+proven with real cross-connection concurrency in `test/lease-concurrency.test.js`. Per-subscription
+ordering and the concurrency cap are enforced by that same atomic claim, so they hold across however
+many worker processes are running too — proven in `test/ordering-and-cap.test.js`. Still one host,
 one SQLite file — not a distributed counter store. See [docs/READINESS.md](docs/READINESS.md) for
 the full contract.
 

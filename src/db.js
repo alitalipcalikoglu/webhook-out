@@ -79,5 +79,11 @@ export class Database extends CoreDatabase {
       seen_at  INTEGER NOT NULL
     );
     `,
+    `
+    -- Stage 10: optional best-effort ordered delivery. Default 0 (false) — existing subscriptions
+    -- are unaffected; unordered delivery behaves exactly as before. See DeliveryStore#claim's doc
+    -- for the exact ordering/claim semantics this column enables.
+    ALTER TABLE subscriptions ADD COLUMN ordered INTEGER NOT NULL DEFAULT 0;
+    `,
   ];
 }

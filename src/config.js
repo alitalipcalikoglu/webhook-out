@@ -38,6 +38,7 @@ export class Config {
     this.retryScheduleSec = v.retryScheduleSec;
     this.deliveryTimeoutMs = v.deliveryTimeoutMs;
     this.workerConcurrency = v.workerConcurrency;
+    this.subscriptionConcurrencyMax = v.subscriptionConcurrencyMax;
     this.pollMs = v.pollMs;
     this.disableAfterFailures = v.disableAfterFailures;
     this.eventRetentionDays = v.eventRetentionDays;
@@ -101,6 +102,10 @@ export class Config {
       retryScheduleSec,
       deliveryTimeoutMs: r.integer('DELIVERY_TIMEOUT_MS', 15_000, { min: 1_000, max: 120_000 }),
       workerConcurrency: r.integer('WORKER_CONCURRENCY', 16, { min: 1, max: 128 }),
+      // Stage 10: bounds how many of one unordered subscription's deliveries may run at once, so
+      // one noisy/slow subscription can't consume the whole worker's concurrency. An ordered
+      // subscription's effective cap is always 1 regardless of this value (see DeliveryStore#claim).
+      subscriptionConcurrencyMax: r.integer('SUBSCRIPTION_CONCURRENCY_MAX', 4, { min: 1 }),
       pollMs: r.integer('POLL_MS', 1_000, { min: 100, max: 60_000 }),
       disableAfterFailures: r.integer('DISABLE_AFTER_FAILURES', 10, { min: 1 }),
       eventRetentionDays: r.integer('EVENT_RETENTION_DAYS', 30, { min: 1 }),

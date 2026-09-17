@@ -4,10 +4,11 @@ import { DeliveryStore } from '../../src/store/delivery-store.js';
 
 /**
  * Runs inside its own OS thread with its own SQLite connection to the SAME database file every
- * sibling thread points at — real cross-connection concurrency for `test/lease-concurrency.test.js`.
- * @type {{ path: string, now: number, leaseMs: number, batch: number, attempts: number }}
+ * sibling thread points at — real cross-connection concurrency for `test/lease-concurrency.test.js`
+ * and Stage 10's ordered/cap multi-process tests.
+ * @type {{ path: string, now: number, leaseMs: number, batch: number, attempts: number, subscriptionConcurrencyMax?: number }}
  */
-const { path, now, leaseMs, batch, attempts } = workerData;
+const { path, now, leaseMs, batch, attempts, subscriptionConcurrencyMax = 1_000_000 } = workerData;
 
 /** See scheduler's identical helper: absorbs a transient SQLITE_LOCKED from many threads opening their first connection to the same file at once. @returns {Database} */
 function openWithRetry() {
@@ -27,7 +28,7 @@ const deliveries = new DeliveryStore(db);
 /** @type {number[]} */
 const claimed = [];
 for (let i = 0; i < attempts; i++) {
-  for (const r of deliveries.claim(now, batch, leaseMs)) claimed.push(r.id);
+  for (const r of deliveries.claim(now, batch, leaseMs, subscriptionConcurrencyMax)) claimed.push(r.id);
 }
 db.close();
 parentPort?.postMessage({ claimed });

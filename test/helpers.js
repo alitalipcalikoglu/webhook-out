@@ -74,7 +74,7 @@ export function testService(overrides) {
   const subscriptionService = new SubscriptionService({ subscriptions, guard, box, options: config, now: clock.now });
   const eventService = new EventService({ db, events, deliveries, subscriptions, options: config, now: clock.now });
   const caller = new HttpCaller({ guard, timeoutMs: config.deliveryTimeoutMs, now: clock.now });
-  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: 5_000 }, now: clock.now });
+  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: 5_000, subscriptionConcurrencyMax: config.subscriptionConcurrencyMax }, now: clock.now });
   return { config, clock, db, subscriptions, events, deliveries, presence, guard, box, subscriptionService, eventService, caller, worker };
 }
 

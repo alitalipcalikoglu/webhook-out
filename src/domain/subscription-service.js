@@ -14,6 +14,7 @@ import { EventMatch } from './event-match.js';
  * @property {string} [description]
  * @property {Record<string, string>} [headers]
  * @property {boolean} [enabled]
+ * @property {boolean} [ordered]  Best-effort ordered delivery (Stage 10). Default false.
  */
 
 /** Subscription lifecycle: validation, secrets (sealed at rest), rotation, pause and resume. */
@@ -63,6 +64,7 @@ export class SubscriptionService {
       created_by: actor,
       created_at: now,
       updated_at: now,
+      ordered: input.ordered ? 1 : 0,
     };
     return { row: this.subscriptions.insert(row), secret };
   }
@@ -106,6 +108,7 @@ export class SubscriptionService {
       status,
       consecutive_failures: failures,
       updated_at: this.now(),
+      ordered: patch.ordered === undefined ? row.ordered : (patch.ordered ? 1 : 0),
     });
   }
 

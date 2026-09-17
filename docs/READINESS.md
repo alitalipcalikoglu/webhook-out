@@ -378,6 +378,69 @@ process's own startup. The in-loop sweep and multi-process topology below both d
 existing — extending the old unconditional logic to run periodically, or from a second process,
 would have stolen a still-live worker's genuinely in-flight delivery.
 
+## Ordering and per-subscription concurrency (Stage 10)
+`subscriptions.ordered` (default `0`/false, additive migration — every existing subscription is
+unaffected) and `SUBSCRIPTION_CONCURRENCY_MAX` (default `4`) are both enforced inside
+`DeliveryStore#claim`'s single query, the same `BEGIN IMMEDIATE` transaction that already makes
+claiming atomic across processes — neither is a process-local `Set`/counter, so both hold under
+real multi-process concurrency exactly like lease ownership does.
+
+**Ordering key**: `(subscription_id, deliveries.id)`. `id` is the `deliveries` table's own
+`INTEGER PRIMARY KEY AUTOINCREMENT`, assigned in creation order (`EventService#publish`/`replay`/
+`redeliver` all insert within one transaction) — a stable, monotonically increasing, collision-free
+sequence per subscription. A timestamp alone was rejected as the ordering key: two deliveries queued
+for the same subscription in the same millisecond (a real possibility under `replay`, which can
+queue many at once) would tie, and a tie has no well-defined "next".
+
+**Claim-time rule for an `ordered` subscription**: a delivery is only a candidate if no OTHER
+non-terminal delivery (`pending`, `running`, or `retrying` — deliberately including `retrying`, not
+just `running`) exists for the same subscription with a smaller `id`. This alone guarantees, with no
+separate bookkeeping: at most one delivery per ordered subscription is ever `running`; delivery N+1
+is never claimed while N is anything but terminal — including while N is sitting out its own retry
+backoff (not yet due again), which is exactly the "N+1 must not overtake N" requirement; and at most
+one row per ordered subscription can ever satisfy the query's WHERE clause in a single call, before
+`LIMIT` is even applied (two candidate rows for the same subscription always see each other as a
+blocking smaller/larger id). An ordered subscription's effective cap is therefore always 1,
+regardless of `SUBSCRIPTION_CONCURRENCY_MAX`.
+
+**Claim-time rule for an unordered subscription's cap**: `running_n + batch_rank <= ?`, where
+`running_n` is that subscription's currently-`running` count (any process) and `batch_rank` is the
+candidate's 1-based position among that subscription's due rows within THIS SAME call, ordered
+identically to the final result — so claiming 3 of one subscription's rows in a single call counts
+as 3 against the cap immediately, before any of their `start` UPDATEs have even run.
+
+**Why this is safe across processes, not just within one**: `DeliveryStore#claim`'s whole body runs
+inside `db.transaction()`, which issues `BEGIN IMMEDIATE` — this acquires SQLite's write lock at the
+very start of the transaction, before the `due` query even runs. A second process's own `claim()`
+call cannot begin its own `BEGIN IMMEDIATE` (and therefore cannot even execute its `running_counts`/
+ordering read) until the first process's transaction has fully committed. There is no window where
+two processes' claim decisions are made from an inconsistent, partially-applied view of each
+other's in-flight claims — the entire decision (read the current state, decide who's eligible,
+write `status = 'running'` for the winners) is one atomic, serialized unit, exactly the same
+primitive lease ownership already relies on.
+
+**Interaction with lease/retry (Stage 6 fencing, unmodified)**: none of the above changes how a
+lease is granted, renewed, or fenced — `owner_token`/`lease_until` and the `WHERE owner_token = ?
+AND status = 'running'` guard on `finish`/`heartbeat` are untouched. A reclaimed ordered delivery
+(lease expired, no heartbeat) goes back to `retrying` exactly as before; the NEXT delivery for that
+subscription still can't be claimed until the reclaimed one reaches a terminal state, because
+`retrying` is one of the three states the ordering check treats as blocking. Proven directly in
+`test/ordering-and-cap.test.js` ("lease expiry + reclaim still fences correctly").
+
+**Telemetry**: a claim attempt is a claim attempt regardless of ordering/cap — `/metrics` and the
+access-log fields for a delivery attempt are unaffected; there is no new "rejected by cap" event to
+log, because the cap and the ordering rule simply mean the row was never selected by `claim()` in
+the first place (nothing to record — it stays `pending`, indistinguishable from "not due yet" until
+it is eventually claimed).
+
+**Best-effort, explicitly not stronger**: this is ordering of WHEN a delivery may start relative to
+its subscription's earlier ones — it is not exactly-once delivery (retries still exist and are the
+point), not global cross-subscription ordering, and not a guarantee that two deliveries can never be
+*in flight* for different reasons at once (e.g. a redelivered/replayed copy of an already-succeeded
+delivery is its own new row with its own, later id — it is correctly ordered after everything queued
+before it, but the semantics of "the same underlying event happening twice" are the receiver's own
+idempotency concern, unchanged from before Stage 10).
+
 ## Scaling model
 **B — single-node stateful, but "single-node" now means one HOST, not one PROCESS.** One SQLite
 file (`node:sqlite` `DatabaseSync`, WAL mode, `busy_timeout` 5 000 ms). `ecosystem.config.cjs`'s
@@ -387,7 +450,9 @@ app documents raising its own `instances` above 1 as a supported topology.
 Two (or more) worker processes pointed at the same file: SQLite's own file locking (`BEGIN
 IMMEDIATE` inside `DeliveryStore.claim`) prevents the same delivery row from being claimed twice —
 proven with real cross-connection concurrency (not same-process `Promise.all`) in
-`test/lease-concurrency.test.js` — and the lease/fencing model above means a crash in one worker is
+`test/lease-concurrency.test.js` — and the same atomicity is what makes per-subscription ordering
+and the concurrency cap hold across processes too (`test/ordering-and-cap.test.js`, "Ordering and
+per-subscription concurrency" above). The lease/fencing model above means a crash in one worker is
 reclaimed by any live sibling's next poll pass, not only by that same process restarting. What is
 **still** per-process and will diverge across instances: `Worker.counters` (`/v1/stats`'s
 `sinceStart`, `/metrics`'s `*_total` counters), the `AuditClient` buffer and flush timer, and the

@@ -15,6 +15,7 @@ export class Views {
       id: s.id, name: s.name, description: s.description, url: s.url, events: /** @type {string[]} */ (JSON.parse(s.events)), headers: JSON.parse(s.headers),
       status: s.status, consecutiveFailures: Number(s.consecutive_failures), lastDeliveryAt: Views.iso(s.last_delivery_at), lastStatus: s.last_status,
       secretRotatedUntil: Views.iso(s.prev_until), createdBy: s.created_by, createdAt: Views.iso(s.created_at), updatedAt: Views.iso(s.updated_at),
+      ordered: Boolean(s.ordered),
     };
   }
 

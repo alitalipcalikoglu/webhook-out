@@ -31,6 +31,7 @@
  * @property {number[]} retryScheduleSec    Delay before retry n (n = 1..); length + 1 = attempts.
  * @property {number} deliveryTimeoutMs
  * @property {number} workerConcurrency
+ * @property {number} subscriptionConcurrencyMax  Cap on one unordered subscription's in-flight deliveries.
  * @property {number} pollMs
  * @property {number} disableAfterFailures  Consecutive dead deliveries that disable a subscription.
  * @property {number} eventRetentionDays
@@ -63,6 +64,7 @@
  * @property {string} created_by
  * @property {number} created_at
  * @property {number} updated_at
+ * @property {number} ordered  0/1 — best-effort ordered delivery (Stage 10); see DeliveryStore#claim.
  */
 
 /**

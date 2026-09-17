@@ -30,7 +30,7 @@ export class Worker {
    * @param {import('./store/heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {import('./net/http-caller.js').HttpCaller} deps.caller
    * @param {MinimalLogger} deps.log
-   * @param {{ concurrency: number, pollMs: number, retentionDays: number, disableAfterFailures: number, leaseMs: number, heartbeatMs: number, drainMs: number }} deps.options
+   * @param {{ concurrency: number, pollMs: number, retentionDays: number, disableAfterFailures: number, leaseMs: number, heartbeatMs: number, drainMs: number, subscriptionConcurrencyMax: number }} deps.options
    * @param {() => number} [deps.now]
    */
   constructor({ events, subscriptionService, subscriptions, deliveries, eventStore, presence, caller, log, options, now = Date.now }) {
@@ -128,7 +128,7 @@ export class Worker {
     if (!this.claiming) return 0;
     const free = this.options.concurrency - this.inFlight.size;
     if (free <= 0) return 0;
-    const claimed = this.deliveries.claim(now, free, this.options.leaseMs);
+    const claimed = this.deliveries.claim(now, free, this.options.leaseMs, this.options.subscriptionConcurrencyMax);
     for (const d of claimed) {
       const p = this.#execute(d).finally(() => this.inFlight.delete(p));
       this.inFlight.add(p);

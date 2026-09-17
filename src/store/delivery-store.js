@@ -30,7 +30,50 @@ export class DeliveryStore {
       insert: db.prepare(`INSERT INTO deliveries (event_id, subscription_id, status, attempt, max_attempts, next_attempt_at, created_at) VALUES (?, ?, 'pending', 0, ?, ?, ?)`),
       get: db.prepare(`SELECT ${C} FROM deliveries WHERE id = ?`),
       // Only active subscriptions receive calls; paused and disabled ones keep their queue.
-      due: db.prepare(`SELECT ${DeliveryStore.COLUMNS.split(', ').map((c) => `d.${c}`).join(', ')} FROM deliveries d JOIN subscriptions s ON s.id = d.subscription_id WHERE d.status IN ('pending', 'retrying') AND d.next_attempt_at <= ? AND s.status = 'active' ORDER BY d.next_attempt_at, d.id LIMIT ?`),
+      //
+      // Ordering/cap (Stage 10): the ordering key is (subscription_id, id) — `id` is the delivery
+      // table's own AUTOINCREMENT primary key, assigned in creation order (publish/replay/redeliver
+      // all insert within one transaction), so it is a stable, collision-free sequence per
+      // subscription; a timestamp alone was rejected as the key for exactly that reason (two
+      // deliveries queued in the same millisecond would tie).
+      //
+      // An `ordered` subscription's row is only a candidate when NO other non-terminal delivery
+      // (pending, running OR retrying — the exact three states named in the spec) exists for that
+      // subscription with a smaller id: this alone is sufficient to guarantee at most one delivery
+      // per ordered subscription is ever `running` at a time, and that delivery N+1 can never be
+      // claimed while N is still pending/running/retrying — including while N is sitting out its
+      // own retry backoff (not yet due), which is exactly the "N+1 must never overtake N" case.
+      // This also means at most one row per ordered subscription can ever pass the WHERE clause in
+      // a single call, even before LIMIT is applied — two rows for the same ordered subscription
+      // can never both qualify, since each would see the other as a smaller/larger blocking id.
+      //
+      // An unordered subscription is capped by `runningCount + batch_rank <= ?` (the second bound
+      // parameter): `running_counts` is this subscription's CURRENTLY running deliveries (from any
+      // process), and `batch_rank` is this row's 1-based position among this SAME subscription's
+      // candidates in THIS call, ordered the same way the final result is — so claiming, say, 3 of
+      // this subscription's due rows in one call correctly counts as 3 against the cap even before
+      // any of their `start` UPDATEs have run yet.
+      due: db.prepare(`
+        WITH running_counts AS (
+          SELECT subscription_id, COUNT(*) AS n FROM deliveries WHERE status = 'running' GROUP BY subscription_id
+        ), candidates AS (
+          SELECT d.id AS d_id, d.subscription_id AS s_id, s.ordered AS s_ordered, COALESCE(rc.n, 0) AS running_n,
+            ROW_NUMBER() OVER (PARTITION BY d.subscription_id ORDER BY d.next_attempt_at, d.id) AS batch_rank
+          FROM deliveries d
+          JOIN subscriptions s ON s.id = d.subscription_id
+          LEFT JOIN running_counts rc ON rc.subscription_id = d.subscription_id
+          WHERE d.status IN ('pending', 'retrying') AND d.next_attempt_at <= ? AND s.status = 'active'
+        )
+        SELECT ${DeliveryStore.COLUMNS.split(', ').map((c) => `d.${c}`).join(', ')}
+        FROM deliveries d JOIN candidates c ON c.d_id = d.id
+        WHERE
+          (c.s_ordered = 1 AND NOT EXISTS (
+            SELECT 1 FROM deliveries e WHERE e.subscription_id = c.s_id AND e.id < c.d_id AND e.status IN ('pending', 'running', 'retrying')
+          ))
+          OR (c.s_ordered = 0 AND c.running_n + c.batch_rank <= ?)
+        ORDER BY d.next_attempt_at, d.id
+        LIMIT ?
+      `),
       start: db.prepare(`UPDATE deliveries SET status = 'running', attempt = attempt + 1, started_at = ?, next_attempt_at = NULL, owner_token = ?, lease_until = ? WHERE id = ? AND status IN ('pending', 'retrying')`),
       finish: db.prepare(`UPDATE deliveries SET status = ?, finished_at = ?, duration_ms = ?, http_status = ?, response = ?, error = ?, attempts = ?, next_attempt_at = ?, owner_token = NULL, lease_until = NULL WHERE id = ? AND owner_token = ? AND status = 'running'`),
       heartbeat: db.prepare(`UPDATE deliveries SET lease_until = ? WHERE id = ? AND owner_token = ? AND status = 'running'`),
@@ -70,14 +113,18 @@ export class DeliveryStore {
   /**
    * Move due deliveries of active subscriptions to `running`, each with a fresh lease, and return
    * them. One transaction, so two loops (in this process or another sharing the file) never claim
-   * the same row.
+   * the same row — and, as of Stage 10, never claim more than one row for the same `ordered`
+   * subscription, nor more than `subscriptionConcurrencyMax` for the same unordered one, across
+   * however many processes are calling this concurrently against the same database. See the `due`
+   * statement's own doc for exactly how.
    * @param {number} now
    * @param {number} limit
    * @param {number} leaseMs
+   * @param {number} subscriptionConcurrencyMax
    */
-  claim(now, limit, leaseMs) {
+  claim(now, limit, leaseMs, subscriptionConcurrencyMax) {
     return this.db.transaction(() => {
-      const rows = /** @type {DeliveryRow[]} */ (this.stmt.due.all(now, limit));
+      const rows = /** @type {DeliveryRow[]} */ (this.stmt.due.all(now, subscriptionConcurrencyMax, limit));
       return rows.map((r) => { this.stmt.start.run(now, randomUUID(), now + leaseMs, r.id); return /** @type {DeliveryRow} */ (this.get(r.id)); });
     });
   }

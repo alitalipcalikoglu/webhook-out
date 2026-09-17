@@ -22,8 +22,8 @@ export class Schemas {
     return { type: 'object', additionalProperties: false, required, properties };
   }
 
-  static createSubscription = Schemas.body(['name', 'url', 'events'], { name: Schemas.name, url: Schemas.url, events: Schemas.events, description: Schemas.description, headers: Schemas.headers, enabled: { type: 'boolean' } });
-  static patchSubscription = { type: 'object', additionalProperties: false, minProperties: 1, properties: { name: Schemas.name, url: Schemas.url, events: Schemas.events, description: Schemas.description, headers: Schemas.headers, enabled: { type: 'boolean' } } };
+  static createSubscription = Schemas.body(['name', 'url', 'events'], { name: Schemas.name, url: Schemas.url, events: Schemas.events, description: Schemas.description, headers: Schemas.headers, enabled: { type: 'boolean' }, ordered: { type: 'boolean' } });
+  static patchSubscription = { type: 'object', additionalProperties: false, minProperties: 1, properties: { name: Schemas.name, url: Schemas.url, events: Schemas.events, description: Schemas.description, headers: Schemas.headers, enabled: { type: 'boolean' }, ordered: { type: 'boolean' } } };
   static replay = Schemas.body(['from'], { from: Schemas.iso, to: Schemas.iso });
   static publish = Schemas.body(['type'], { type: Schemas.eventType, data: {}, idempotencyKey: { type: 'string', minLength: 1, maxLength: 128 } });
 

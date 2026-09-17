@@ -115,7 +115,7 @@ test('Worker: paused subscriptions queue; timeouts retry; recovery after a crash
 
   // Crash: claim without executing, then recover.
   const { deliveries: [d] } = ev.publish({ type: 'z', data: {} }, 'x');
-  const [claimed] = deliveries.claim(clock.now(), 1, 30_000); // default LEASE_MS
+  const [claimed] = deliveries.claim(clock.now(), 1, 30_000, 1_000_000); // default LEASE_MS
   assert.equal(claimed.id, d.id);
   clock.advance(31_000); // past the lease, so recover() (Stage 6: only reclaims expired leases) picks it up
   worker.recover();

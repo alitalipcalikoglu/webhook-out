@@ -33,7 +33,7 @@ test('Concurrency: several real connections racing for the same due deliveries n
     const events = new EventStore(db);
     const deliveries = new DeliveryStore(db);
     const now = Date.now();
-    const sub = subscriptions.insert({ id: 'sub_1', name: 's', description: '', url: 'https://api.partner.example/x', events: '["*"]', headers: '{}', secret_enc: 'x', prev_secret_enc: null, prev_until: null, status: 'active', consecutive_failures: 0, last_delivery_at: null, last_status: null, created_by: 'test', created_at: now, updated_at: now });
+    const sub = subscriptions.insert({ id: 'sub_1', name: 's', description: '', url: 'https://api.partner.example/x', events: '["*"]', headers: '{}', secret_enc: 'x', prev_secret_enc: null, prev_until: null, status: 'active', consecutive_failures: 0, last_delivery_at: null, last_status: null, created_by: 'test', created_at: now, updated_at: now, ordered: 0 });
     const event = events.insert({ id: 'evt_1', type: 'x', data: '{}', idem_key: null, source: 'test', only_subscription: null, created_at: now });
     const N = 12;
     for (let i = 0; i < N; i++) deliveries.insert({ eventId: event.id, subscriptionId: sub.id, maxAttempts: 3, nextAttemptAt: now }, now);
