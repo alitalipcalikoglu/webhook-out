@@ -122,6 +122,37 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+One process owns one SQLite file (WAL mode); `ecosystem.config.cjs` pins `instances: 1` for this
+reason. SQLite's own locking means a second instance against the same file would not corrupt data
+or double-claim a delivery, but every piece of state that is not in SQLite — worker counters,
+the audit-forwarding buffer, the `/ready` cache — is per-process, so two instances would disagree
+with each other on `/v1/stats` and `/metrics` and gain no extra throughput. Running more than one
+instance is not a supported deployment today. See [docs/READINESS.md](docs/READINESS.md) for the
+full contract.
+
+## Observability
+
+Every request gets a `reqId`, either generated or accepted unconditionally from an inbound
+`X-Request-Id` (`requestIdHeader: 'x-request-id'`, matching every other internal-only service on
+this platform). This service does not yet parse or forward the platform's `traceparent` header —
+that is implemented in `gateway` only — and neither of its own outbound calls (subscriber
+deliveries, audit batches) forwards a request id or trace context onward. `GET /metrics` mixes
+database-backed counts (subscriptions, events, deliveries by status) with in-memory counters that
+reset on restart (delivery outcomes since start, retries, disables). See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Backup / restore
+
+The state that matters is the SQLite file at `DB_PATH` plus, out of band, `SECRETS_KEY` (without
+it, stored subscriber secrets are unreadable) and `WEBHOOK_API_KEYS` — neither lives in the
+database. There is no backup automation in this repository yet: capture a consistent copy with the
+process stopped, or with SQLite's own snapshot tools (`.backup` / `VACUUM INTO`) while it runs, since
+plain `cp` can miss data still in the WAL file. Restoring means putting the file back at `DB_PATH`
+with the *same* `SECRETS_KEY` that sealed it, then verifying with `/ready` and a read call. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
