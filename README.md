@@ -57,7 +57,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/health`, `/ready` | none | Liveness; readiness (database, cached 10 s) with worker state. |
+| GET | `/health`, `/ready`, `/v1/info` | none | Liveness; readiness (database, cached 10 s) with worker state; service identity (version, API version, capabilities, schema version, service-core version). |
 | POST | `/v1/subscriptions` | write | `{ name, url, events, description?, headers?, enabled? }` → `201 { subscription, secret }`. |
 | GET | `/v1/subscriptions` | read | Sorted by name; `q`, `status`, `event`, `limit` ≤ 200, `cursor`. |
 | GET / PATCH / DELETE | `/v1/subscriptions/:id` | read / write / write | Read; partial update incl. `enabled`; delete with its deliveries. |
