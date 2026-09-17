@@ -30,7 +30,7 @@ export class Worker {
    * @param {import('./store/heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {import('./net/http-caller.js').HttpCaller} deps.caller
    * @param {MinimalLogger} deps.log
-   * @param {{ concurrency: number, pollMs: number, retentionDays: number, disableAfterFailures: number, leaseMs: number, heartbeatMs: number }} deps.options
+   * @param {{ concurrency: number, pollMs: number, retentionDays: number, disableAfterFailures: number, leaseMs: number, heartbeatMs: number, drainMs: number }} deps.options
    * @param {() => number} [deps.now]
    */
   constructor({ events, subscriptionService, subscriptions, deliveries, eventStore, presence, caller, log, options, now = Date.now }) {
@@ -72,14 +72,30 @@ export class Worker {
     this.claiming = false;
   }
 
-  /** Stop claiming (if not already) and wait for in-flight calls to finish. */
+  /**
+   * Stop claiming (if not already) and wait for in-flight calls to finish, bounded by
+   * `options.drainMs` (Stage 6.1) — under ordinary operation every in-flight call already has its
+   * own real timeout (`DELIVERY_TIMEOUT_MS`), so the drain finishes well within `drainMs`. If it
+   * doesn't (a call somehow bypassed its own timeout), this stops waiting and logs loudly rather
+   * than hanging the whole shutdown sequence forever.
+   */
   async stop() {
     if (!this.running) return;
     this.running = false;
     this.claiming = false;
     this.abort.abort();
     await this.loop;
-    await Promise.allSettled(this.inFlight);
+    // The losing side of this race must be cancelled explicitly: node:timers/promises' sleep()
+    // otherwise keeps its timer alive for the full drainMs even after in-flight draining already
+    // won the race — harmless in production (process.exit() doesn't wait on pending timers) but it
+    // visibly hangs anything that inspects the event loop (tests included) for up to drainMs.
+    const drainAbort = new AbortController();
+    const outcome = await Promise.race([
+      Promise.allSettled(this.inFlight).then(() => /** @type {const} */ ('drained')),
+      sleep(this.options.drainMs, undefined, { signal: drainAbort.signal }).then(() => /** @type {const} */ ('timed-out')).catch(() => /** @type {const} */ ('timed-out')),
+    ]);
+    drainAbort.abort();
+    if (outcome === 'timed-out') this.log.error({ inFlight: this.inFlight.size, drainMs: this.options.drainMs }, 'drain timed out; continuing shutdown with deliveries still in flight');
     this.loop = null;
     this.log.info('worker stopped');
   }

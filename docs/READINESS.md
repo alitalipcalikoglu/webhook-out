@@ -95,6 +95,11 @@ fixed this order — see below for what it was and why):
    requests to finish. Present only in the API and combined roles.
 3. `await worker.stop()` — (redundant `running = false`) waits (`Promise.allSettled`) for
    deliveries already executing to finish, clearing each one's heartbeat interval as it settles.
+   Stage 6.1: this wait is itself bounded by `options.drainMs` (`config.deliveryTimeoutMs + 5_000`)
+   — races `Promise.allSettled(inFlight)` against a `sleep(drainMs)`, cancelled with an
+   `AbortController` so the loser doesn't leak a timer. On timeout it logs `'drain timed out;
+   continuing shutdown with deliveries still in flight'` and moves straight to the remaining steps
+   instead of hanging forever.
 4. `await audit.close()` — stops the audit flush timer and flushes whatever is still buffered,
    including its own retry loop (see Retry policy).
 5. `db.close()`.
@@ -110,6 +115,15 @@ under the new 150 s `kill_timeout` regardless of how `DELIVERY_TIMEOUT_MS` is co
 validated range, closing the previously-real misconfiguration this section used to describe (raising
 `DELIVERY_TIMEOUT_MS` toward its own max used to push the force-exit timer past the old, static
 40 s `kill_timeout`).
+
+The five numbers that matter for shutdown, and why `drainMs < forceExitMs` by design (a 5 s margin):
+worker drain timeout (`drainMs = deliveryTimeoutMs + 5_000`) fires first and lets audit-flush/db-close
+still run; the outer force-exit timer (`deliveryTimeoutMs + 10_000`) is the hard backstop that calls
+`process.exit(1)` if even those remaining steps hang; `DELIVERY_TIMEOUT_MS` is the external call's own
+timeout (what bounds one delivery attempt); `HEARTBEAT_MS` is how often an in-flight delivery renews
+its lease; `LEASE_MS` is the lease TTL a stalled/crashed worker's claim expires after, for another
+worker to reclaim. PM2's `kill_timeout` (150 s) sits above all of them so PM2 never SIGKILLs before
+the app's own force-exit timer has a chance to run.
 
 Audit's own flush retry loop (up to 6 attempts with backoff, cumulative sleeps of roughly
 1+2+4+8+16 s, plus up to 5 s per HTTP attempt) can still, by itself, consume a large fraction of the
@@ -349,8 +363,11 @@ token per claim can never collide with a previous one) and **`lease_until`** (re
 = ? AND status = 'running'`, so a worker that hung long enough to be reclaimed by someone else can
 never overwrite the row when it eventually returns. `DeliveryStore#reclaimExpired` (called by
 `Worker#recover()` at startup, labeled `"interrupted by restart"`, and by the in-loop
-`#reclaimStale()` on every poll pass, labeled `"lease expired"`) reads every expired-lease row and
-settles it as a failed attempt inside one transaction with every write — the same race-free
+`#reclaimStale()` on every poll pass, labeled `"lease expired"`) reads every row whose `lease_until`
+is strictly less than `now` (`now == lease_until` is NOT yet expired — same invariant as
+claim/heartbeat/finish, locked in by the Stage 6.1 regression test `test/lease.test.js`
+"DeliveryStore: reclaimExpired exact-boundary invariant") and settles it as a failed attempt inside
+one transaction with every write — the same race-free
 construction as `scheduler`'s identical primitive (see its README for the full "why one
 transaction" reasoning, kept independent per service rather than shared since the state machines
 and store shapes differ).

@@ -99,7 +99,7 @@ test('Worker: a late-returning owner cannot overwrite a delivery another worker 
   const [claimed] = svc.deliveries.claim(svc.clock.now(), 1, 5_000);
   const staleToken = /** @type {string} */ (claimed.owner_token);
   svc.clock.advance(6_000);
-  const worker2 = new Worker({ events: svc.eventService, subscriptionService: svc.subscriptionService, subscriptions: svc.subscriptions, deliveries: svc.deliveries, eventStore: svc.events, presence: new HeartbeatStore(new Database(':memory:')), caller: new HttpCaller({ guard: new NetGuard({ allowHttp: true, allowPrivate: true, allowedHosts: [] }), timeoutMs: 5000 }), log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, disableAfterFailures: 10, leaseMs: 5_000, heartbeatMs: 1_000 }, now: svc.clock.now });
+  const worker2 = new Worker({ events: svc.eventService, subscriptionService: svc.subscriptionService, subscriptions: svc.subscriptions, deliveries: svc.deliveries, eventStore: svc.events, presence: new HeartbeatStore(new Database(':memory:')), caller: new HttpCaller({ guard: new NetGuard({ allowHttp: true, allowPrivate: true, allowedHosts: [] }), timeoutMs: 5000 }), log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, disableAfterFailures: 10, leaseMs: 5_000, heartbeatMs: 1_000, drainMs: 5_000 }, now: svc.clock.now });
   worker2.recover();
   const afterReclaim = svc.deliveries.get(d.id);
   assert.equal(afterReclaim?.status, 'retrying');
@@ -122,11 +122,46 @@ test('Worker: heartbeat keeps a long in-flight call owned across the original le
   const subscriptionService = new SubscriptionService({ subscriptions, guard, box, options: config });
   const eventService = new EventService({ db, events, deliveries, subscriptions, options: config });
   const caller = new HttpCaller({ guard, timeoutMs: 2000 });
-  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, disableAfterFailures: 10, leaseMs: 120, heartbeatMs: 40 } });
+  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, disableAfterFailures: 10, leaseMs: 120, heartbeatMs: 40, drainMs: 5_000 } });
   subscriptionService.create({ name: 's', url: `${rx.url}/x`, events: ['*'] }, 'console');
   const { deliveries: [d] } = eventService.publish({ type: 'x', data: {} }, 'src');
   await worker.tick();
   const r = deliveries.get(d.id);
   assert.equal(r?.status, 'succeeded', r?.error ?? 'should have succeeded, not lost the lease to its own dead heartbeat');
   assert.equal(r?.attempt, 1);
+});
+
+test('DeliveryStore: reclaimExpired exact-boundary invariant — now == lease_until is NOT yet expired (Stage 6.1)', () => {
+  const t = testService();
+  const d = seedOne(t);
+  const [claimed] = t.deliveries.claim(t.clock.now(), 1, 1_000);
+  const leaseUntil = /** @type {number} */ (claimed.lease_until);
+  const decide = (/** @type {any} */ r) => ({ status: /** @type {const} */ ('failed'), finishedAt: leaseUntil, durationMs: 0, httpStatus: null, response: null, error: 'lease expired', attempts: JSON.parse(r.attempts), nextAttemptAt: null });
+  assert.deepEqual(t.deliveries.reclaimExpired(leaseUntil, decide), [], 'now === lease_until: still valid, same invariant as claim/heartbeat/finish');
+  assert.equal(t.deliveries.get(d.id)?.status, 'running');
+  const reclaimed = t.deliveries.reclaimExpired(leaseUntil + 1, decide);
+  assert.equal(reclaimed.length, 1, 'one ms later: now expired');
+});
+
+test('Worker: stop() is bounded by drainMs even if an in-flight call never resolves (Stage 6.1)', async () => {
+  const t = testService();
+  t.subscriptionService.create({ name: 's', url: 'https://api.partner.example/x', events: ['*'] }, 'console');
+  t.eventService.publish({ type: 'x', data: {} }, 'src');
+  /** @type {[object, string][]} */
+  const errors = [];
+  const log = /** @type {any} */ ({
+    info() {}, warn() {}, debug() {}, fatal() {}, child() { return this; },
+    error(/** @type {object} */ obj, /** @type {string} */ msg) { errors.push([obj, msg]); },
+  });
+  const stuckCaller = { call: () => new Promise(() => {}) };
+  const worker = new Worker({ events: t.eventService, subscriptionService: t.subscriptionService, subscriptions: t.subscriptions, deliveries: t.deliveries, eventStore: t.events, presence: new HeartbeatStore(new Database(':memory:')), caller: /** @type {any} */ (stuckCaller), log, options: { concurrency: 1, pollMs: 20, retentionDays: 30, disableAfterFailures: 10, leaseMs: 30_000, heartbeatMs: 1_000, drainMs: 100 }, now: t.clock.now });
+  worker.start();
+  const deadline = Date.now() + 2_000;
+  while (t.deliveries.stats(0).byStatus.running === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  const startedStop = Date.now();
+  await worker.stop();
+  const elapsed = Date.now() - startedStop;
+  assert.ok(elapsed < 1_000, `stop() must not hang forever; took ${elapsed}ms with drainMs=100`);
+  assert.equal(errors.length, 1, 'logs exactly the drain-timeout error');
+  assert.match(errors[0][1], /drain timed out/);
 });
