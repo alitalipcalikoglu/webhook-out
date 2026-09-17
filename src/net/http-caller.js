@@ -1,32 +1,19 @@
-import http from 'node:http';
-import https from 'node:https';
+import { CallError, HttpCaller as CoreHttpCaller } from '@atc-web/service-core/http';
 import { Signer } from './signer.js';
 
-/** @typedef {import('./net-guard.js').NetGuard} NetGuard */
+/** @typedef {import('@atc-web/service-core/http').NetGuard} NetGuard */
 /** @typedef {import('../types.js').CallResult} CallResult */
 
-export class CallError extends Error {
-  /**
-   * @param {string} message
-   * @param {{ httpStatus?: number|null, response?: string, retryable: boolean, code?: string }} info
-   */
-  constructor(message, info) {
-    super(message);
-    this.name = 'CallError';
-    this.httpStatus = info.httpStatus ?? null;
-    this.response = info.response ?? '';
-    this.retryable = info.retryable;
-    this.code = info.code;
-  }
-}
+export { CallError };
 
 /**
  * Performs one delivery: SSRF guard, signature with the subscriber's secret(s), delivery headers,
- * pinned address, timeout, bounded response capture. Redirects are not followed.
+ * pinned address, timeout, bounded response capture. Redirects are not followed. The socket work
+ * (pinned-address connect, timeout, bounded response read) is service-core's `HttpCaller.send()`;
+ * the signing, headers and always-POST/JSON delivery shape below are this service's own policy.
  */
 export class HttpCaller {
   static USER_AGENT = 'atc-webhook-out/1.0';
-  static MAX_RESPONSE = 1024;
 
   /**
    * @param {object} opts
@@ -45,7 +32,7 @@ export class HttpCaller {
    * @returns {Promise<CallResult>} 2xx outcome; rejects with {@link CallError} otherwise.
    */
   async call({ url, headers: custom, secrets, body, event, delivery, attempt, subscription }) {
-    /** @type {import('./net-guard.js').VettedTarget} */
+    /** @type {import('@atc-web/service-core/http').VettedTarget} */
     let vetted;
     try {
       vetted = await this.guard.resolve(url);
@@ -69,49 +56,11 @@ export class HttpCaller {
       'x-webhook-timestamp': new Date(now).toISOString(),
       [Signer.HEADER]: Signer.sign(body, Math.floor(now / 1000), secrets),
     };
-    return this.#send(vetted, headers, body);
-  }
-
-  /**
-   * @param {import('./net-guard.js').VettedTarget} target
-   * @param {Record<string, string>} headers
-   * @param {string} body
-   * @returns {Promise<CallResult>}
-   */
-  #send(target, headers, body) {
-    const client = target.url.protocol === 'https:' ? https : http;
-    return new Promise((resolve, reject) => {
-      const req = client.request(target.url, {
-        method: 'POST',
-        headers,
-        timeout: this.timeoutMs,
-        // Pin the vetted address; TLS SNI and the Host header still use the hostname.
-        lookup: (_host, opts, cb) => (opts.all
-          ? cb(null, [{ address: target.address, family: target.family }])
-          : cb(null, target.address, target.family)),
-      }, (res) => {
-        const status = res.statusCode ?? 0;
-        /** @type {Buffer[]} */
-        const chunks = [];
-        let size = 0;
-        res.on('data', (c) => {
-          if (size < HttpCaller.MAX_RESPONSE) { chunks.push(c); size += c.length; }
-        });
-        res.on('end', () => {
-          const snippet = Buffer.concat(chunks).toString('utf8', 0, HttpCaller.MAX_RESPONSE).replace(/\s+/g, ' ').trim();
-          if (status >= 200 && status < 300) return resolve({ httpStatus: status, response: snippet });
-          reject(new CallError(`receiver responded ${status}${snippet ? `: ${snippet.slice(0, 200)}` : ''}`, { httpStatus: status, response: snippet, retryable: HttpCaller.isRetryableStatus(status) }));
-        });
-        res.on('error', (err) => reject(new CallError(`response error: ${err.message}`, { retryable: true })));
-      });
-      req.on('timeout', () => req.destroy(new CallError(`receiver timed out after ${this.timeoutMs}ms`, { retryable: true, code: 'TIMEOUT' })));
-      req.on('error', (err) => reject(err instanceof CallError ? err : new CallError(`request error: ${err.message}`, { retryable: true, code: /** @type {{ code?: string }} */ (err).code })));
-      req.end(body);
-    });
+    return CoreHttpCaller.send(vetted, 'POST', headers, body, this.timeoutMs, 'receiver');
   }
 
   /** Whether a failed delivery with this status may succeed later. @param {number} status */
   static isRetryableStatus(status) {
-    return status === 408 || status === 425 || status === 429 || status >= 500;
+    return CoreHttpCaller.isRetryableStatus(status);
   }
 }

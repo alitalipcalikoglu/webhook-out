@@ -6,7 +6,7 @@ import { EventService } from '../src/domain/event-service.js';
 import { SubscriptionService } from '../src/domain/subscription-service.js';
 import { WebhookApi } from '../src/http/webhook-api.js';
 import { HttpCaller } from '../src/net/http-caller.js';
-import { NetGuard } from '../src/net/net-guard.js';
+import { NetGuard } from '@atc-web/service-core/http';
 import { DeliveryStore } from '../src/store/delivery-store.js';
 import { EventStore } from '../src/store/event-store.js';
 import { SubscriptionStore } from '../src/store/subscription-store.js';

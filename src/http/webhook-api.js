@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
-import { AuditClient } from '../net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
+import { createErrorHandler, jsonParser, registerProbes } from '@atc-web/service-core/fastify';
 import { WebhookError } from '../domain/errors.js';
 import { DeliveryStore } from '../store/delivery-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
@@ -29,7 +30,7 @@ export class WebhookApi {
    * @param {import('../worker.js').Worker} deps.worker
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
-   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
+   * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
   constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, worker, db, logger }) {
     this.config = config;
@@ -43,7 +44,6 @@ export class WebhookApi {
     this.db = db;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
-    this.readyCache = { at: 0, ok: false, error: '' };
   }
 
   /** @returns {Promise<FastifyInstance>} */
@@ -61,16 +61,8 @@ export class WebhookApi {
     });
     app.decorateRequest('apiKey', /** @type {any} */ (null));
     // Action endpoints (rotate, test, redeliver, cancel) take no body; clients that always send a JSON content type must not get a parse error.
-    app.removeContentTypeParser('application/json');
-    app.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => {
-      if (body === '') return done(null, undefined);
-      try {
-        done(null, JSON.parse(/** @type {string} */ (body)));
-      } catch {
-        done(Object.assign(new Error('body is not valid JSON'), { statusCode: 400, code: 'INVALID_JSON' }), undefined);
-      }
-    });
-    app.setErrorHandler(this.#errorHandler);
+    jsonParser(app);
+    app.setErrorHandler(createErrorHandler(WebhookError));
     app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
@@ -79,56 +71,12 @@ export class WebhookApi {
       reply.header('x-content-type-options', 'nosniff');
       reply.header('cache-control', 'no-store');
     });
-    this.#registerProbes(app);
+    registerProbes(app, () => this.db.ping(), { cacheMs: WebhookApi.READY_CACHE_MS, extra: () => ({ worker: this.worker.running ? 'running' : 'stopped' }) });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
   }
 
-  /** @type {FastifyInstance['errorHandler']} */
-  #errorHandler = (rawErr, request, reply) => {
-    const err = /** @type {import('fastify').FastifyError & { validation?: { instancePath: string, message?: string, params: object }[] }} */ (rawErr);
-    if (err instanceof WebhookError) {
-      return reply.code(err.statusCode).send({ error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) } });
-    }
-    if (err.validation) {
-      return reply.code(400).send({
-        error: { code: 'VALIDATION_FAILED', message: err.message, details: err.validation.map((v) => ({ path: v.instancePath, message: v.message, params: v.params })) },
-      });
-    }
-    const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 500;
-    if (status >= 500) {
-      request.log.error({ err }, 'unhandled error');
-      return reply.code(status).send({ error: { code: 'INTERNAL_ERROR', message: 'internal error' } });
-    }
-    return reply.code(status).send({ error: { code: err.code ?? 'REQUEST_ERROR', message: err.message } });
-  };
-
-  /** @param {FastifyInstance} app */
-  #registerProbes(app) {
-    app.get('/health', { logLevel: 'warn' }, async () => ({ status: 'ok' }));
-    app.get('/ready', { logLevel: 'warn' }, async (_request, reply) => {
-      const ready = this.#readiness();
-      if (!ready.ok) {
-        app.log.warn({ error: ready.error }, 'readiness check failed');
-        return reply.code(503).send({ status: 'unavailable', error: ready.error });
-      }
-      return { status: 'ok', worker: this.worker.running ? 'running' : 'stopped' };
-    });
-  }
-
-  #readiness() {
-    const now = Date.now();
-    if (now - this.readyCache.at > WebhookApi.READY_CACHE_MS) {
-      try {
-        this.db.ping();
-        this.readyCache = { at: now, ok: true, error: '' };
-      } catch (err) {
-        this.readyCache = { at: now, ok: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    }
-    return this.readyCache;
-  }
 
   /** @param {FastifyInstance} api */
   async #registerV1(api) {

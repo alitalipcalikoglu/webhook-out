@@ -6,6 +6,6 @@ declare module 'fastify' {
     apiKey: import('./types.js').ApiKey;
   }
   interface FastifyContextConfig {
-    audit?: import('./net/audit-client.js').AuditRouteConfig;
+    audit?: import('@atc-web/service-core/audit').AuditRouteConfig;
   }
 }
