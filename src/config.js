@@ -10,6 +10,15 @@ export class Config {
   static MIN_SECRET_LENGTH = 32;
   static ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
+  // Stage 6.2: single source of truth for the two shutdown-timer margins, so `application.js`
+  // never re-derives this arithmetic by hand (that duplication is exactly how notify's Stage 6.1
+  // forceExitMs bug happened). `externalCallCeilingMs < drainMs < forceExitMs` holds unconditionally
+  // for any valid DELIVERY_TIMEOUT_MS — the margins are fixed, not operator-configurable — so there
+  // is no invalid combination for config validation to reject here; `test/config.test.js` locks the
+  // ordering in instead.
+  static DRAIN_MARGIN_MS = 5_000;
+  static FORCE_EXIT_MARGIN_MS = 10_000;
+
   /** @param {import('./types.js').ConfigValues} v */
   constructor(v) {
     this.port = v.port;
@@ -39,6 +48,15 @@ export class Config {
     this.heartbeatMs = v.heartbeatMs;
     Object.freeze(this);
   }
+
+  /** The worst-case duration of one external call this process makes — what shutdown timers are sized against. */
+  get externalCallCeilingMs() { return this.deliveryTimeoutMs; }
+
+  /** Bound on `Worker#stop()`'s own wait for in-flight deliveries. */
+  get drainMs() { return this.externalCallCeilingMs + Config.DRAIN_MARGIN_MS; }
+
+  /** Process-wide force-exit backstop; strictly greater than {@link drainMs}. */
+  get forceExitMs() { return this.externalCallCeilingMs + Config.FORCE_EXIT_MARGIN_MS; }
 
   /**
    * @param {NodeJS.ProcessEnv} [env]

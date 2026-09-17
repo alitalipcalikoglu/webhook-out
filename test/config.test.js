@@ -28,3 +28,24 @@ test('Config: rejects bad input', () => {
   bad({ DELIVERY_TIMEOUT_MS: '500' }, />= 1000/);
   bad({ TLS_CERT_PATH: '/x.pem' }, /must be set together/);
 });
+
+test('Config: 0 < HEARTBEAT_MS < LEASE_MS invariant (Stage 6.2)', () => {
+  const bad = (/** @type {Record<string,string>} */ o, /** @type {RegExp} */ re) => assert.throws(() => Config.fromEnv(testEnv(o)), (e) => e instanceof ConfigError && re.test(e.message));
+  bad({ HEARTBEAT_MS: '5000', LEASE_MS: '5000' }, /HEARTBEAT_MS must be less than LEASE_MS/);
+  bad({ HEARTBEAT_MS: '6000', LEASE_MS: '5000' }, /HEARTBEAT_MS must be less than LEASE_MS/);
+  bad({ HEARTBEAT_MS: '0' }, /HEARTBEAT_MS must be >= 250/);
+  bad({ LEASE_MS: '0' }, /LEASE_MS must be >= 2000/);
+  const c = Config.fromEnv(testEnv({ HEARTBEAT_MS: '1000', LEASE_MS: '5000' }));
+  assert.equal(c.heartbeatMs, 1_000);
+  assert.equal(c.leaseMs, 5_000);
+});
+
+test('Config: externalCallCeilingMs < drainMs < forceExitMs across the whole DELIVERY_TIMEOUT_MS range (Stage 6.2)', () => {
+  for (const deliveryTimeoutMs of [1_000, 15_000, 120_000]) {
+    const c = Config.fromEnv(testEnv({ DELIVERY_TIMEOUT_MS: String(deliveryTimeoutMs) }));
+    assert.equal(c.externalCallCeilingMs, deliveryTimeoutMs);
+    assert.equal(c.drainMs, deliveryTimeoutMs + 5_000);
+    assert.equal(c.forceExitMs, deliveryTimeoutMs + 10_000);
+    assert.ok(c.externalCallCeilingMs < c.drainMs && c.drainMs < c.forceExitMs);
+  }
+});
