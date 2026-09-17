@@ -1,4 +1,5 @@
 import { Config } from './config.js';
+import { AuditClient } from './net/audit-client.js';
 import { SecretBox } from './crypto/secret-box.js';
 import { Database } from './db.js';
 import { EventService } from './domain/event-service.js';
@@ -19,6 +20,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath);
     this.subscriptions = new SubscriptionStore(this.db);
     this.events = new EventStore(this.db);
@@ -51,11 +53,13 @@ export class Application {
     const { config } = this;
     const worker = new Worker({ events: this.eventService, subscriptionService: this.subscriptionService, subscriptions: this.subscriptions, deliveries: this.deliveries, eventStore: this.events, caller: this.caller, log: /** @type {any} */ (console), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures } });
     this.worker = worker;
-    const api = new WebhookApi({ config, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, worker, db: this.db });
+    const api = new WebhookApi({ config, audit: this.audit, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, worker, db: this.db });
     const app = await api.build();
     this.app = app;
     worker.log = app.log.child({ component: 'worker' });
     this.#installSignalHandlers(app.log);
+    this.audit.logger = app.log;
+    this.audit.start();
     await app.listen({ port: config.port, host: config.host });
     app.log.info({ tls: config.tls !== null, subscriptions: this.subscriptions.counts(), retrySchedule: config.retryScheduleSec }, config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
     worker.start();
@@ -74,6 +78,7 @@ export class Application {
     }, this.config.deliveryTimeoutMs + 10_000).unref();
     try {
       await this.app?.close();
+      await this.audit.close();
       await this.worker?.stop();
       this.db.close();
       clearTimeout(forceExit);

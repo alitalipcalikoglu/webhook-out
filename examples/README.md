@@ -15,6 +15,7 @@ Scenario-driven walkthroughs of every feature. Requests to `/v1/*` need `Authori
 | [Events and deliveries](history.md) | Listing, filters, pagination, event types, stats |
 | [API keys and roles](keys-and-roles.md) | read, write, readwrite, publish; error codes |
 | [Operations](operations.md) | Health, readiness, metrics, environment, PM2, Docker, backups, the secrets key |
+| [Audit events](audit-events.md) | Which write actions are forwarded to the audit service, event shape, configuration |
 
 Set up once for the examples:
 
