@@ -147,10 +147,19 @@ reset on restart (delivery outcomes since start, retries, disables). See
 
 The state that matters is the SQLite file at `DB_PATH` plus, out of band, `SECRETS_KEY` (without
 it, stored subscriber secrets are unreadable) and `WEBHOOK_API_KEYS` — neither lives in the
-database. There is no backup automation in this repository yet: capture a consistent copy with the
-process stopped, or with SQLite's own snapshot tools (`.backup` / `VACUUM INTO`) while it runs, since
-plain `cp` can miss data still in the WAL file. Restoring means putting the file back at `DB_PATH`
-with the *same* `SECRETS_KEY` that sealed it, then verifying with `/ready` and a read call. See
+database. Use `stack backup`/`stack restore` from the workspace root (see `stack/docs/UPGRADE.md`)
+to snapshot and restore the database consistently alongside the rest of the stack — it uses
+`VACUUM INTO` against the live file, so a consistent copy does not require stopping the process or
+risk missing data still in the WAL file. `SECRETS_KEY` and `WEBHOOK_API_KEYS` are not part of that
+backup and must be captured separately. On every start, before applying a pending migration to an
+existing database, the service itself also snapshots the file to `DB_PATH.pre-v<N>-<timestamp>`
+(directory overridable with `DB_BACKUP_DIR`) — a manual last resort if `stack restore` is
+unavailable. Restoring means putting the file back at `DB_PATH` with the *same* `SECRETS_KEY` that
+sealed it, then verifying with `/ready` and a read call.
+
+**Rollback limitations:** none of the migrations are reversible; to roll back, restore the
+pre-migration copy (or a `stack backup` snapshot taken before the upgrade), with the matching
+`SECRETS_KEY`, and run the previous version of this service against it. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## License

@@ -20,6 +20,7 @@ export class Config {
     this.audit = v.audit;
     this.bodyLimit = v.bodyLimit;
     this.dbPath = v.dbPath;
+    this.dbBackupDir = v.dbBackupDir;
     this.apiKeys = v.apiKeys;
     this.secretsKey = v.secretsKey;
     this.targetAllowHttp = v.targetAllowHttp;
@@ -64,6 +65,7 @@ export class Config {
       audit: parseAudit(r),
       bodyLimit: r.integer('BODY_LIMIT', 65_536, { min: 1_024 }),
       dbPath: r.optional('DB_PATH') || './data/webhook-out.db',
+      dbBackupDir: r.optional('DB_BACKUP_DIR') || undefined,
       apiKeys: Config.#parseApiKeys(r.required('WEBHOOK_API_KEYS')),
       secretsKey: Buffer.from(secretsKeyHex, 'hex'),
       targetAllowHttp: target.allowHttp,

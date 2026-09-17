@@ -22,6 +22,7 @@
  * @property {{ url: string, apiKey: string }|null} audit   Audit service to forward events to; null = off.
  * @property {number} bodyLimit
  * @property {string} dbPath
+ * @property {string} [dbBackupDir]
  * @property {ApiKey[]} apiKeys
  * @property {Buffer} secretsKey            32-byte key that encrypts subscriber secrets at rest.
  * @property {boolean} targetAllowHttp

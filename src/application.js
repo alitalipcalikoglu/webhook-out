@@ -22,7 +22,7 @@ export class Application {
   constructor(config) {
     this.config = config;
     this.audit = new AuditClient({ target: config.audit });
-    this.db = new Database(config.dbPath);
+    this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.subscriptions = new SubscriptionStore(this.db);
     this.events = new EventStore(this.db);
     this.deliveries = new DeliveryStore(this.db);
