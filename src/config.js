@@ -35,6 +35,8 @@ export class Config {
     this.maxEventBytes = v.maxEventBytes;
     this.prevSecretGraceHours = v.prevSecretGraceHours;
     this.rateLimitMax = v.rateLimitMax;
+    this.leaseMs = v.leaseMs;
+    this.heartbeatMs = v.heartbeatMs;
     Object.freeze(this);
   }
 
@@ -55,6 +57,13 @@ export class Config {
     const target = parseTarget(r);
 
     const retryScheduleSec = Config.#parseSchedule(r.optional('RETRY_SCHEDULE_SEC') || '60,300,1800,7200,21600,86400');
+
+    // Stage 6: lease ownership. heartbeatMs must stay well under leaseMs — see ratelimit/scheduler's
+    // identical validation for the reasoning (a single missed heartbeat must not itself be enough
+    // to lose the lease).
+    const leaseMs = r.integer('LEASE_MS', 30_000, { min: 2_000, max: 300_000 });
+    const heartbeatMs = r.integer('HEARTBEAT_MS', 10_000, { min: 250 });
+    if (heartbeatMs >= leaseMs) throw new ConfigError('HEARTBEAT_MS must be less than LEASE_MS');
 
     return new Config({
       port: r.integer('PORT', 3009, { min: 0, max: 65535 }),
@@ -80,6 +89,8 @@ export class Config {
       maxEventBytes: r.integer('MAX_EVENT_BYTES', 65_536, { min: 256 }),
       prevSecretGraceHours: r.integer('PREV_SECRET_GRACE_HOURS', 24, { min: 0, max: 720 }),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 1_200, { min: 1 }),
+      leaseMs,
+      heartbeatMs,
     });
   }
 

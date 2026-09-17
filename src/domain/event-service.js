@@ -55,7 +55,21 @@ export class EventService {
         if (existing) return { event: existing, deliveries: this.deliveries.forEvent(existing.id), duplicate: true };
       }
       const now = this.now();
-      const event = this.events.insert({ id: EventService.newId(), type, data, idem_key: input.idempotencyKey ?? null, source, only_subscription: null, created_at: now });
+      let event;
+      try {
+        event = this.events.insert({ id: EventService.newId(), type, data, idem_key: input.idempotencyKey ?? null, source, only_subscription: null, created_at: now });
+      } catch (err) {
+        // Belt and braces: the check-then-insert above already can't race across connections (this
+        // whole method runs inside one BEGIN IMMEDIATE transaction, so a concurrent publish with
+        // the same key blocks until this one commits, then sees the row on its own check). This
+        // only fires if that invariant is ever broken elsewhere — return the existing event instead
+        // of a raw constraint error surfacing as 500.
+        if (input.idempotencyKey && EventService.#isUniqueViolation(err)) {
+          const existing = this.events.byIdempotencyKey(source, input.idempotencyKey);
+          if (existing) return { event: existing, deliveries: this.deliveries.forEvent(existing.id), duplicate: true };
+        }
+        throw err;
+      }
       const targets = this.subscriptions.active().filter((s) => EventMatch.any(JSON.parse(s.events), type));
       return { event, deliveries: targets.map((s) => this.#queue(event, s, now)), duplicate: false };
     });
@@ -151,5 +165,10 @@ export class EventService {
 
   static newId() {
     return `evt_${randomBytes(8).toString('hex')}`;
+  }
+
+  /** @param {unknown} err */
+  static #isUniqueViolation(err) {
+    return /** @type {{ code?: string, message?: string }} */ (err).code === 'ERR_SQLITE_ERROR' && /UNIQUE constraint failed/.test(/** @type {{ message?: string }} */ (err).message ?? '');
   }
 }

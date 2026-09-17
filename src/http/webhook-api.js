@@ -14,10 +14,18 @@ import { Views } from './views.js';
 /** @typedef {import('fastify').FastifyInstance} FastifyInstance */
 /** @typedef {import('fastify').FastifyRequest} FastifyRequest */
 
-/** HTTP surface: subscriptions and deliveries (write/read roles), publishing (publish role). */
+/**
+ * HTTP surface: subscriptions and deliveries (write/read roles), publishing (publish role).
+ *
+ * `worker` is `null` in the API-only role (Stage 6, `src/api-main.js`) — see `scheduler`'s
+ * `http/scheduler-api.js` module doc for the identical reasoning (`presence`/`runningCount()`
+ * fallback, `sinceStart` reported `null` rather than a misleading zero).
+ */
 export class WebhookApi {
   static READY_CACHE_MS = 10_000;
   static STATS_WINDOW_MS = 86_400_000;
+  /** A worker_heartbeat row older than this many worker heartbeat intervals is considered dead. */
+  static PRESENCE_STALE_FACTOR = 4;
 
   /**
    * @param {object} deps
@@ -27,12 +35,13 @@ export class WebhookApi {
    * @param {import('../store/subscription-store.js').SubscriptionStore} deps.subscriptions
    * @param {import('../store/event-store.js').EventStore} deps.events
    * @param {import('../store/delivery-store.js').DeliveryStore} deps.deliveries
-   * @param {import('../worker.js').Worker} deps.worker
+   * @param {import('../store/heartbeat-store.js').HeartbeatStore} deps.presence
+   * @param {import('../worker.js').Worker|null} deps.worker
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, worker, db, logger }) {
+  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, presence, worker, db, logger }) {
     this.config = config;
     this.audit = audit;
     this.subs = subscriptionService;
@@ -40,10 +49,18 @@ export class WebhookApi {
     this.subscriptions = subscriptions;
     this.events = events;
     this.deliveries = deliveries;
+    this.presence = presence;
     this.worker = worker;
     this.db = db;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
+  }
+
+  /** `'running'`/`'stopped'`, from the in-process `Worker` when there is one, else from `worker_heartbeat`. @param {number} [now] */
+  workerStatus(now = Date.now()) {
+    if (this.worker) return this.worker.running ? 'running' : 'stopped';
+    const seenAt = this.presence.latest();
+    return seenAt !== null && now - seenAt < this.config.heartbeatMs * WebhookApi.PRESENCE_STALE_FACTOR ? 'running' : 'stopped';
   }
 
   /** @returns {Promise<FastifyInstance>} */
@@ -71,7 +88,7 @@ export class WebhookApi {
       reply.header('x-content-type-options', 'nosniff');
       reply.header('cache-control', 'no-store');
     });
-    registerProbes(app, () => this.db.ping(), { cacheMs: WebhookApi.READY_CACHE_MS, extra: () => ({ worker: this.worker.running ? 'running' : 'stopped' }) });
+    registerProbes(app, () => this.db.ping(), { cacheMs: WebhookApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
@@ -180,7 +197,9 @@ export class WebhookApi {
       subscriptions: this.subscriptions.counts(),
       events: { total: this.events.total(), last24h: this.events.countSince(since) },
       deliveries: { byStatus: d.byStatus, last24h: d.recentByStatus, backlog: { queued: d.backlog.queued, oldestAt: Views.iso(d.backlog.oldestAt) }, avgDurationMs24h: d.recentAvgDurationMs, topFailures24h: d.recentFailures },
-      worker: { running: this.worker.running, inFlight: this.worker.inFlight.size, concurrency: this.config.workerConcurrency, sinceStart: { ...this.worker.counters } },
+      worker: this.worker
+        ? { running: this.worker.running, inFlight: this.worker.inFlight.size, concurrency: this.config.workerConcurrency, sinceStart: { ...this.worker.counters } }
+        : { running: this.workerStatus(now) === 'running', inFlight: this.deliveries.runningCount(), concurrency: this.config.workerConcurrency, sinceStart: null },
     };
   }
 
@@ -190,7 +209,10 @@ export class WebhookApi {
     ops.get('/metrics', { logLevel: 'warn', preValidation: ApiKeyAuth.require('read') }, async (_request, reply) => {
       const s = this.subscriptions.counts();
       const d = this.deliveries.stats(Date.now() - WebhookApi.STATS_WINDOW_MS);
-      const c = this.worker.counters;
+      // Process-local since-start counters: zero (not omitted) from an API-only process — honest,
+      // since this process itself never finished a delivery, rather than a gap a scraper has to explain.
+      const c = this.worker?.counters ?? { succeeded: 0, failed: 0, retried: 0, disabled: 0 };
+      const inFlight = this.worker ? this.worker.inFlight.size : this.deliveries.runningCount();
       reply.type('text/plain; version=0.0.4; charset=utf-8');
       return [
         '# HELP webhook_subscriptions Subscriptions by status.',
@@ -220,9 +242,12 @@ export class WebhookApi {
         '# HELP webhook_oldest_queued_age_seconds Age of the oldest queued delivery, 0 when none.',
         '# TYPE webhook_oldest_queued_age_seconds gauge',
         `webhook_oldest_queued_age_seconds ${d.backlog.oldestAt === null ? 0 : ((Date.now() - d.backlog.oldestAt) / 1000).toFixed(0)}`,
-        '# HELP webhook_in_flight Calls currently executing.',
+        '# HELP webhook_in_flight Calls currently executing (durable, from the deliveries table, when this process has no worker of its own).',
         '# TYPE webhook_in_flight gauge',
-        `webhook_in_flight ${this.worker.inFlight.size}`,
+        `webhook_in_flight ${inFlight}`,
+        '# HELP webhook_worker_up 1 if a worker process is currently alive (this process itself, or another one reporting through worker_heartbeat), else 0.',
+        '# TYPE webhook_worker_up gauge',
+        `webhook_worker_up ${this.workerStatus() === 'running' ? 1 : 0}`,
         '# HELP webhook_process_uptime_seconds Process uptime.',
         '# TYPE webhook_process_uptime_seconds gauge',
         `webhook_process_uptime_seconds ${process.uptime().toFixed(0)}`,

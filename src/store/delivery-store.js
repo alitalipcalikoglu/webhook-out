@@ -1,11 +1,25 @@
+import { randomUUID } from 'node:crypto';
+
 /** @typedef {import('../db.js').Database} Database */
 /** @typedef {import('../types.js').DeliveryRow} DeliveryRow */
 /** @typedef {import('../types.js').DeliveryStatus} DeliveryStatus */
 /** @typedef {import('../types.js').Attempt} Attempt */
+/** @typedef {import('../types.js').FinishOutcome} FinishOutcome */
 
-/** Persistence for deliveries: the work queue (pending/retrying) and the history. */
+/**
+ * Persistence for deliveries: the work queue (pending/retrying) and the history.
+ *
+ * Lease ownership (Stage 6): `claim()` hands each row a fresh random `owner_token` (the fencing
+ * token) and a `lease_until`. Every write that ends a claimed attempt — {@link finish} and
+ * {@link heartbeat} — is guarded by `WHERE owner_token = ? AND status = 'running'`, so it can only
+ * ever affect the row it thinks it owns: a worker that claimed a delivery, then hung long enough
+ * for another process to reclaim it (see {@link reclaimExpired}), can no longer overwrite that row
+ * when it eventually returns — its `owner_token` no longer matches, and by then `status` isn't
+ * `'running'` under it either. See `scheduler`'s `store/run-store.js` for the identical design
+ * (kept independent, not shared, since the two services' state machines and columns differ).
+ */
 export class DeliveryStore {
-  static COLUMNS = 'id, event_id, subscription_id, status, attempt, max_attempts, next_attempt_at, started_at, finished_at, duration_ms, http_status, response, error, attempts, created_at';
+  static COLUMNS = 'id, event_id, subscription_id, status, attempt, max_attempts, next_attempt_at, started_at, finished_at, duration_ms, http_status, response, error, attempts, created_at, owner_token, lease_until';
   static STATUSES = /** @type {const} */ (['pending', 'running', 'retrying', 'succeeded', 'failed', 'cancelled']);
 
   /** @param {Database} db */
@@ -17,10 +31,12 @@ export class DeliveryStore {
       get: db.prepare(`SELECT ${C} FROM deliveries WHERE id = ?`),
       // Only active subscriptions receive calls; paused and disabled ones keep their queue.
       due: db.prepare(`SELECT ${DeliveryStore.COLUMNS.split(', ').map((c) => `d.${c}`).join(', ')} FROM deliveries d JOIN subscriptions s ON s.id = d.subscription_id WHERE d.status IN ('pending', 'retrying') AND d.next_attempt_at <= ? AND s.status = 'active' ORDER BY d.next_attempt_at, d.id LIMIT ?`),
-      start: db.prepare(`UPDATE deliveries SET status = 'running', attempt = attempt + 1, started_at = ?, next_attempt_at = NULL WHERE id = ? AND status IN ('pending', 'retrying')`),
-      finish: db.prepare(`UPDATE deliveries SET status = ?, finished_at = ?, duration_ms = ?, http_status = ?, response = ?, error = ?, attempts = ?, next_attempt_at = ? WHERE id = ?`),
+      start: db.prepare(`UPDATE deliveries SET status = 'running', attempt = attempt + 1, started_at = ?, next_attempt_at = NULL, owner_token = ?, lease_until = ? WHERE id = ? AND status IN ('pending', 'retrying')`),
+      finish: db.prepare(`UPDATE deliveries SET status = ?, finished_at = ?, duration_ms = ?, http_status = ?, response = ?, error = ?, attempts = ?, next_attempt_at = ?, owner_token = NULL, lease_until = NULL WHERE id = ? AND owner_token = ? AND status = 'running'`),
+      heartbeat: db.prepare(`UPDATE deliveries SET lease_until = ? WHERE id = ? AND owner_token = ? AND status = 'running'`),
       cancel: db.prepare(`UPDATE deliveries SET status = 'cancelled', finished_at = ?, error = ?, next_attempt_at = NULL WHERE id = ? AND status IN ('pending', 'retrying')`),
-      running: db.prepare(`SELECT ${C} FROM deliveries WHERE status = 'running'`),
+      expiredLeases: db.prepare(`SELECT ${C} FROM deliveries WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)`),
+      runningCount: db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE status = 'running'`),
       byStatus: db.prepare(`SELECT status, COUNT(*) AS n FROM deliveries GROUP BY status`),
       recentByStatus: db.prepare(`SELECT status, COUNT(*) AS n FROM deliveries WHERE created_at >= ? GROUP BY status`),
       backlog: db.prepare(`SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM deliveries WHERE status IN ('pending', 'retrying')`),
@@ -52,35 +68,67 @@ export class DeliveryStore {
   }
 
   /**
-   * Move due deliveries of active subscriptions to `running`. One transaction, so two loops
-   * never claim the same row.
+   * Move due deliveries of active subscriptions to `running`, each with a fresh lease, and return
+   * them. One transaction, so two loops (in this process or another sharing the file) never claim
+   * the same row.
    * @param {number} now
    * @param {number} limit
+   * @param {number} leaseMs
    */
-  claim(now, limit) {
+  claim(now, limit, leaseMs) {
     return this.db.transaction(() => {
       const rows = /** @type {DeliveryRow[]} */ (this.stmt.due.all(now, limit));
-      return rows.map((r) => { this.stmt.start.run(now, r.id); return /** @type {DeliveryRow} */ (this.get(r.id)); });
+      return rows.map((r) => { this.stmt.start.run(now, randomUUID(), now + leaseMs, r.id); return /** @type {DeliveryRow} */ (this.get(r.id)); });
     });
   }
 
   /**
+   * Record an attempt's outcome, but only while `ownerToken` still holds the lease. Returns the
+   * updated row, or `null` if the lease had already moved on (see {@link reclaimExpired}) — in
+   * which case nothing was written and the caller must not treat this as a normal completion.
    * @param {number} id
-   * @param {{ status: 'succeeded'|'failed'|'retrying', finishedAt: number|null, durationMs: number, httpStatus: number|null, response: string|null, error: string|null, attempts: Attempt[], nextAttemptAt: number|null }} o
+   * @param {string} ownerToken
+   * @param {FinishOutcome} o
    */
-  finish(id, o) {
-    this.stmt.finish.run(o.status, o.finishedAt, o.durationMs, o.httpStatus, o.response, o.error, JSON.stringify(o.attempts), o.nextAttemptAt, id);
-    return /** @type {DeliveryRow} */ (this.get(id));
+  finish(id, ownerToken, o) {
+    const { changes } = this.stmt.finish.run(o.status, o.finishedAt, o.durationMs, o.httpStatus, o.response, o.error, JSON.stringify(o.attempts), o.nextAttemptAt, id, ownerToken);
+    return Number(changes) > 0 ? /** @type {DeliveryRow} */ (this.get(id)) : null;
+  }
+
+  /**
+   * Renew the lease while a call is still in flight. Returns whether `ownerToken` still holds it —
+   * `false` means another process already reclaimed this delivery.
+   * @param {number} id @param {string} ownerToken @param {number} now @param {number} leaseMs
+   */
+  heartbeat(id, ownerToken, now, leaseMs) {
+    return Number(this.stmt.heartbeat.run(now + leaseMs, id, ownerToken).changes) > 0;
+  }
+
+  /**
+   * Atomically find every delivery whose lease has expired (or predates leases) and, in the SAME
+   * transaction, finish each one via `decide(delivery)` — a pure function computing the same shape
+   * {@link finish} takes. See `scheduler`'s `run-store.js#reclaimExpired` for why running the read
+   * and every write inside one transaction is what makes this race-free against a concurrent
+   * {@link heartbeat}.
+   * @param {number} now
+   * @param {(d: DeliveryRow) => FinishOutcome} decide
+   * @returns {DeliveryRow[]}
+   */
+  reclaimExpired(now, decide) {
+    return this.db.transaction(() => {
+      const stale = /** @type {DeliveryRow[]} */ (this.stmt.expiredLeases.all(now));
+      return stale.map((d) => /** @type {DeliveryRow} */ (this.finish(d.id, /** @type {string} */ (d.owner_token), decide(d))));
+    });
+  }
+
+  /** Live in-flight count, for an API-only process that has no in-process Worker to ask. */
+  runningCount() {
+    return Number(/** @type {{ n: number }} */ (this.stmt.runningCount.get()).n);
   }
 
   /** @param {number} id @param {string} reason @param {number} now */
   cancel(id, reason, now) {
     return Number(this.stmt.cancel.run(now, reason, id).changes) > 0;
-  }
-
-  /** Deliveries left `running` by a previous process. */
-  running() {
-    return /** @type {DeliveryRow[]} */ (this.stmt.running.all());
   }
 
   /**

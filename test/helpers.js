@@ -9,6 +9,7 @@ import { HttpCaller } from '../src/net/http-caller.js';
 import { NetGuard } from '@atc-web/service-core/http';
 import { DeliveryStore } from '../src/store/delivery-store.js';
 import { EventStore } from '../src/store/event-store.js';
+import { HeartbeatStore } from '../src/store/heartbeat-store.js';
 import { SubscriptionStore } from '../src/store/subscription-store.js';
 import { Worker } from '../src/worker.js';
 
@@ -67,13 +68,14 @@ export function testService(overrides) {
   const subscriptions = new SubscriptionStore(db);
   const events = new EventStore(db);
   const deliveries = new DeliveryStore(db);
+  const presence = new HeartbeatStore(db);
   const guard = new NetGuard({ allowHttp: config.targetAllowHttp, allowPrivate: config.targetAllowPrivate, allowedHosts: config.targetAllowedHosts });
   const box = new SecretBox(config.secretsKey);
   const subscriptionService = new SubscriptionService({ subscriptions, guard, box, options: config, now: clock.now });
   const eventService = new EventService({ db, events, deliveries, subscriptions, options: config, now: clock.now });
   const caller = new HttpCaller({ guard, timeoutMs: config.deliveryTimeoutMs, now: clock.now });
-  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures }, now: clock.now });
-  return { config, clock, db, subscriptions, events, deliveries, guard, box, subscriptionService, eventService, caller, worker };
+  const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs }, now: clock.now });
+  return { config, clock, db, subscriptions, events, deliveries, presence, guard, box, subscriptionService, eventService, caller, worker };
 }
 
 /** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */

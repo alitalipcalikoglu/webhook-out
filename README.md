@@ -116,21 +116,39 @@ Class-based; dependencies are injected through constructors, `src/application.js
 - Ordered delivery guarantees: put a sequence in `data`.
 - Subscriber self-service (partners creating their own subscriptions): front this API with your own portal and a `write` key.
 - Encryption of event payloads at rest: sign, do not encrypt; keep secrets out of `data`.
-- Multi-node execution: one process per database; scale by splitting subscribers across instances.
+- True multi-host distribution: every process (API or worker, however many) must reach the same `DB_PATH` file on one host — there is no network-shared counter store. Splitting across hosts still means splitting subscribers across separate `webhook-out` instances, each with its own database.
 
 ## Audit events
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
-## Scaling model
+## API/worker runtime split
 
-One process owns one SQLite file (WAL mode); `ecosystem.config.cjs` pins `instances: 1` for this
-reason. SQLite's own locking means a second instance against the same file would not corrupt data
-or double-claim a delivery, but every piece of state that is not in SQLite — worker counters,
-the audit-forwarding buffer, the `/ready` cache — is per-process, so two instances would disagree
-with each other on `/v1/stats` and `/metrics` and gain no extra throughput. Running more than one
-instance is not a supported deployment today. See [docs/READINESS.md](docs/READINESS.md) for the
-full contract.
+`src/index.js` (default) runs both the HTTP API and the worker loop in one process — nothing about
+existing single-process deployments changes. Two more entry points exist for a split deployment:
+`src/api-main.js` (HTTP only, never claims a delivery) and `src/worker-main.js` (worker only, no
+HTTP listener at all — PM2's own process state is the liveness signal). All three share the same
+`Config`, the same database, the same migrations. `npm run api` / `npm run worker` run them
+directly; `ecosystem.config.cjs` has the split apps ready to uncomment. An API-only process's
+`/ready` and `/v1/stats` report worker liveness and in-flight count from the database
+(`worker_heartbeat`, `deliveries.status = 'running'`) instead of an in-process `Worker` object.
+
+## Lease ownership and scaling model
+
+Every claimed delivery gets a fencing token (`owner_token`) and a lease (`lease_until`), not just a
+status column. A worker renews the lease every `HEARTBEAT_MS` while a call is in flight
+(`LEASE_MS`, default 30s; `HEARTBEAT_MS`, default 10s — must be well under `LEASE_MS`), so a call
+taking longer than `LEASE_MS` never loses its lease on its own. If a worker crashes or hangs long
+enough that its lease genuinely expires, another worker (or the same one, restarted) reclaims the
+delivery as a failed attempt — following the normal retry schedule — and the fencing token means
+the original worker cannot overwrite that outcome if it later finishes the call it no longer owns.
+
+This makes **multiple worker processes against the same `DB_PATH` a supported topology**: the
+commented-out split `webhook-out-worker` app in `ecosystem.config.cjs` can run with `instances` >
+1. Claiming is atomic across processes (`BEGIN IMMEDIATE` around the whole read-decide-write),
+proven with real cross-connection concurrency in `test/lease-concurrency.test.js`. Still one host,
+one SQLite file — not a distributed counter store. See [docs/READINESS.md](docs/READINESS.md) for
+the full contract.
 
 ## Observability
 

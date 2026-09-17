@@ -37,6 +37,8 @@
  * @property {number} maxEventBytes
  * @property {number} prevSecretGraceHours
  * @property {number} rateLimitMax
+ * @property {number} leaseMs          How long a claimed delivery's lease lasts without a heartbeat.
+ * @property {number} heartbeatMs      How often an in-flight delivery's lease is renewed; must be < leaseMs.
  */
 
 /** @typedef {import('./config.js').Config} Config */
@@ -95,6 +97,22 @@
  * @property {string|null} error
  * @property {string} attempts             JSON array of {@link Attempt}.
  * @property {number} created_at
+ * @property {string|null} owner_token     The fencing token of whoever currently holds the lease; null when not `running`.
+ * @property {number|null} lease_until     ms since epoch; null when not `running` (or a pre-Stage-6 leftover row).
+ */
+
+/**
+ * The shape {@link import('./store/delivery-store.js').DeliveryStore#finish} takes — an attempt's
+ * outcome already reduced to a terminal or retrying decision.
+ * @typedef {object} FinishOutcome
+ * @property {'succeeded'|'retrying'|'failed'} status
+ * @property {number|null} finishedAt
+ * @property {number} durationMs
+ * @property {number|null} httpStatus
+ * @property {string|null} response
+ * @property {string|null} error
+ * @property {Attempt[]} attempts
+ * @property {number|null} nextAttemptAt
  */
 
 /**
@@ -114,5 +132,19 @@
  */
 
 /** @typedef {import('fastify').FastifyBaseLogger} Logger */
+
+/**
+ * The subset of a logger every non-HTTP consumer (`Worker`, `Lifecycle`) actually needs —
+ * satisfied both by a real Fastify/pino logger and by `ConsoleLogger` (used when there is no
+ * Fastify instance to log through, i.e. the worker-only role).
+ * @typedef {object} MinimalLogger
+ * @property {(o: object|string, m?: string) => void} info
+ * @property {(o: object|string, m?: string) => void} warn
+ * @property {(o: object|string, m?: string) => void} error
+ * @property {(o: object|string, m?: string) => void} fatal
+ * @property {(o: object|string, m?: string) => void} debug
+ * @property {(o: object|string, m?: string) => void} trace
+ * @property {(bindings: object) => MinimalLogger} child
+ */
 
 export {};

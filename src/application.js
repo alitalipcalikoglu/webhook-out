@@ -1,6 +1,7 @@
 import { Config } from './config.js';
 import { AuditClient } from '@atc-web/service-core/audit';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
+import { ConsoleLogger } from '@atc-web/service-core/log';
 import { SecretBox } from './crypto/secret-box.js';
 import { Database } from './db.js';
 import { EventService } from './domain/event-service.js';
@@ -10,22 +11,34 @@ import { HttpCaller } from './net/http-caller.js';
 import { NetGuard } from '@atc-web/service-core/http';
 import { DeliveryStore } from './store/delivery-store.js';
 import { EventStore } from './store/event-store.js';
+import { HeartbeatStore } from './store/heartbeat-store.js';
 import { SubscriptionStore } from './store/subscription-store.js';
 import { Worker } from './worker.js';
+
+/** @typedef {'combined'|'api'|'worker'} Role */
 
 /**
  * Composition root: wires configuration, storage, domain, outbound calls, HTTP and the worker,
  * and owns the process lifecycle.
+ *
+ * `role` (Stage 6) picks which of the two runtimes this process actually runs — see `scheduler`'s
+ * `Application` module doc for the identical reasoning (`'combined'` default, `'api'`: HTTP only
+ * no `Worker`, `'worker'`: `Worker` only no HTTP listener at all).
  */
 export class Application {
-  /** @param {Config} config */
-  constructor(config) {
+  /**
+   * @param {Config} config
+   * @param {{ role?: Role }} [opts]
+   */
+  constructor(config, { role = 'combined' } = {}) {
     this.config = config;
+    this.role = role;
     this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.subscriptions = new SubscriptionStore(this.db);
     this.events = new EventStore(this.db);
     this.deliveries = new DeliveryStore(this.db);
+    this.presence = new HeartbeatStore(this.db);
     const guard = new NetGuard({ allowHttp: config.targetAllowHttp, allowPrivate: config.targetAllowPrivate, allowedHosts: config.targetAllowedHosts });
     this.subscriptionService = new SubscriptionService({ subscriptions: this.subscriptions, guard, box: new SecretBox(config.secretsKey), options: config });
     this.eventService = new EventService({ db: this.db, events: this.events, deliveries: this.deliveries, subscriptions: this.subscriptions, options: config });
@@ -38,10 +51,13 @@ export class Application {
     this.shutdown = async () => {};
   }
 
-  /** Build from `process.env`; exits with a readable message on bad configuration. */
-  static fromEnv() {
+  /**
+   * Build from `process.env`; exits with a readable message on bad configuration.
+   * @param {{ role?: Role }} [opts]
+   */
+  static fromEnv(opts) {
     try {
-      return new Application(Config.fromEnv());
+      return new Application(Config.fromEnv(), opts);
     } catch (err) {
       if (err instanceof Error && err.name === 'ConfigError') {
         console.error(`configuration error: ${err.message}`);
@@ -52,32 +68,51 @@ export class Application {
   }
 
   async start() {
-    const { config } = this;
-    const worker = new Worker({ events: this.eventService, subscriptionService: this.subscriptionService, subscriptions: this.subscriptions, deliveries: this.deliveries, eventStore: this.events, caller: this.caller, log: /** @type {any} */ (console), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures } });
-    this.worker = worker;
-    const api = new WebhookApi({ config, audit: this.audit, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, worker, db: this.db });
-    const app = await api.build();
-    this.app = app;
-    worker.log = app.log.child({ component: 'worker' });
-    // Order preserved exactly as before this extraction (audit flushes before the worker drains
-    // in-flight deliveries) — a known, separately tracked defect, not something to fix here.
-    const { shutdown } = Lifecycle.install({
-      forceExitMs: this.config.deliveryTimeoutMs + 10_000,
-      log: app.log,
-      steps: [
-        () => this.app?.close(),
-        () => this.audit.close(),
-        () => this.worker?.stop(),
-        () => this.db.close(),
-      ],
-    });
+    const { config, role } = this;
+    const runsApi = role !== 'worker';
+    const runsWorker = role !== 'api';
+
+    /** @type {import('./types.js').MinimalLogger} */
+    let log = new ConsoleLogger({ level: /** @type {any} */ (config.logLevel) });
+
+    if (runsWorker) {
+      this.worker = new Worker({ events: this.eventService, subscriptionService: this.subscriptionService, subscriptions: this.subscriptions, deliveries: this.deliveries, eventStore: this.events, presence: this.presence, caller: this.caller, log: log.child({ component: 'worker' }), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs } });
+    }
+
+    /** @type {(() => (void|Promise<void>))[]} */
+    const steps = [];
+
+    if (runsApi) {
+      const api = new WebhookApi({ config, audit: this.audit, subscriptionService: this.subscriptionService, eventService: this.eventService, subscriptions: this.subscriptions, events: this.events, deliveries: this.deliveries, presence: this.presence, worker: this.worker, db: this.db });
+      const app = await api.build();
+      this.app = app;
+      log = app.log;
+      if (this.worker) this.worker.log = app.log.child({ component: 'worker' });
+    }
+
+    // Shutdown order (Stage 6 fix): stop claiming new work first, then stop HTTP intake, THEN
+    // drain whatever the worker already had in flight, THEN flush audit, THEN close the DB. Audit
+    // used to flush before the worker drained — see `scheduler`'s `application.js` for the full
+    // reasoning (identical fix, same bug class). `worker.stop()`'s own bounded wait is
+    // `forceExitMs` below — no separate per-step drain timeout.
+    if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stopClaiming());
+    if (this.app) steps.push(() => this.app?.close());
+    if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stop());
+    steps.push(() => this.audit.close());
+    steps.push(() => this.db.close());
+
+    const { shutdown } = Lifecycle.install({ forceExitMs: config.deliveryTimeoutMs + 10_000, log, steps });
     this.shutdown = shutdown;
-    this.audit.logger = app.log;
+    this.audit.logger = log;
     this.audit.start();
-    await app.listen({ port: config.port, host: config.host });
-    app.log.info({ tls: config.tls !== null, subscriptions: this.subscriptions.counts(), retrySchedule: config.retryScheduleSec }, config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
-    worker.start();
+
+    if (this.app) {
+      await this.app.listen({ port: config.port, host: config.host });
+      this.app.log.info({ tls: config.tls !== null, role, subscriptions: this.subscriptions.counts(), retrySchedule: config.retryScheduleSec }, config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
+    } else {
+      log.info({ role }, 'worker-only process: no HTTP listener');
+    }
+    if (this.worker) this.worker.start();
     if (process.send) process.send('ready'); // PM2 wait_ready
   }
-
 }

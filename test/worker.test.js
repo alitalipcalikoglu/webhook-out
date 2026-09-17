@@ -115,8 +115,9 @@ test('Worker: paused subscriptions queue; timeouts retry; recovery after a crash
 
   // Crash: claim without executing, then recover.
   const { deliveries: [d] } = ev.publish({ type: 'z', data: {} }, 'x');
-  const [claimed] = deliveries.claim(clock.now(), 1);
+  const [claimed] = deliveries.claim(clock.now(), 1, 30_000); // default LEASE_MS
   assert.equal(claimed.id, d.id);
+  clock.advance(31_000); // past the lease, so recover() (Stage 6: only reclaims expired leases) picks it up
   worker.recover();
   const rec = /** @type {import('../src/types.js').DeliveryRow} */ (deliveries.get(d.id));
   assert.deepEqual([rec.status, rec.error, rec.attempt, iso(rec.next_attempt_at)], ['retrying', 'interrupted by restart', 1, iso(clock.now() + 5_000)]);
@@ -131,12 +132,20 @@ test('Worker: paused subscriptions queue; timeouts retry; recovery after a crash
   assert.equal(sd.get(sdl.id)?.status, 'retrying');
   assert.match(String(sd.get(sdl.id)?.error), /timed out after 100ms/);
 
-  // Retention purges old events with their deliveries, whatever the delivery status.
+  // Retention purges old events, but NOT (Stage 6) while a delivery is still pending/retrying/
+  // running — a paused subscriber's still-queued work must survive past its event's retention.
   const old = clock.now() - 8 * 86_400_000;
   events.insert({ id: 'evt_0000000000000001', type: 'old', data: '{}', idem_key: null, source: 'x', only_subscription: null, created_at: old });
-  deliveries.insert({ eventId: 'evt_0000000000000001', subscriptionId: live.id, maxAttempts: 1, nextAttemptAt: clock.now() + 3_600_000 }, old);
+  const stillQueued = deliveries.insert({ eventId: 'evt_0000000000000001', subscriptionId: live.id, maxAttempts: 1, nextAttemptAt: clock.now() + 3_600_000 }, old);
   worker.lastMaintenance = 0;
   await worker.tick();
-  assert.equal(events.get('evt_0000000000000001'), undefined);
+  assert.ok(events.get('evt_0000000000000001'), 'kept: its delivery is still pending');
+  assert.equal(deliveries.get(stillQueued.id)?.status, 'pending', 'the delivery itself is untouched by purge');
+
+  // Once the delivery reaches a terminal state, the next purge removes the event (and, by cascade, the delivery).
+  deliveries.cancel(stillQueued.id, 'test cleanup', clock.now());
+  worker.lastMaintenance = 0;
+  await worker.tick();
+  assert.equal(events.get('evt_0000000000000001'), undefined, 'purged now that nothing is still queued for it');
   assert.equal(deliveries.list({ eventId: 'evt_0000000000000001' }, { limit: 5 }).length, 0);
 });

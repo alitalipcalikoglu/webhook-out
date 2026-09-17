@@ -16,7 +16,11 @@ export class EventStore {
       get: db.prepare(`SELECT ${C} FROM events WHERE id = ?`),
       byIdem: db.prepare(`SELECT ${C} FROM events WHERE source = ? AND idem_key = ?`),
       range: db.prepare(`SELECT ${C} FROM events WHERE created_at >= ? AND created_at < ? AND only_subscription IS NULL ORDER BY seq LIMIT ?`),
-      purge: db.prepare(`DELETE FROM events WHERE created_at < ?`),
+      // A paused/broken subscriber's still-queued (or in-flight) work must not be destroyed by
+      // retention purge just because the event that created it happens to be old — the cascade on
+      // events -> deliveries is real (ON DELETE CASCADE, db.js), so this exclusion is load-bearing,
+      // not decorative.
+      purge: db.prepare(`DELETE FROM events WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM deliveries WHERE deliveries.event_id = events.id AND deliveries.status IN ('pending', 'retrying', 'running'))`),
       types: db.prepare(`SELECT type, COUNT(*) AS n, MAX(created_at) AS last FROM events WHERE only_subscription IS NULL GROUP BY type ORDER BY type`),
       countSince: db.prepare(`SELECT COUNT(*) AS n FROM events WHERE created_at >= ? AND only_subscription IS NULL`),
       total: db.prepare(`SELECT COUNT(*) AS n FROM events`),

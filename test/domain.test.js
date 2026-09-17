@@ -131,3 +131,31 @@ test('EventService: publish fans out to matching active subscriptions; idempoten
   s.remove(b.id);
   assert.equal(deliveries.list({ subscriptionId: b.id }, { limit: 10 }).length, 0, 'deliveries go with the subscription');
 });
+
+test('EventService: publish falls back to the existing event on a UNIQUE violation, instead of a raw 500 (belt and braces)', () => {
+  // The check-then-insert in publish() already can't race across connections (one BEGIN IMMEDIATE
+  // transaction serializes it — see event-service.js's comment): a genuine race would need
+  // byIdempotencyKey to miss at check time (nothing committed yet) and then insert() to conflict
+  // anyway, with the SAME key resolving on a second lookup — the exact sequence forced below,
+  // since single-threaded tests cannot otherwise produce a true TOCTOU here.
+  const { subscriptionService: s, eventService: ev } = testService();
+  s.create({ name: 'a', url: 'https://api.partner.example/a', events: ['*'] }, 'console');
+  const concurrentWriter = ev.events.insert({ id: 'evt_concurrent', type: 'order.paid', data: '{}', idem_key: 'k1', source: 'shop', only_subscription: null, created_at: Date.now() });
+
+  const realByIdem = ev.events.byIdempotencyKey.bind(ev.events);
+  const realInsert = ev.events.insert.bind(ev.events);
+  let byIdemCalls = 0;
+  ev.events.byIdempotencyKey = (/** @type {string} */ source, /** @type {string} */ key) => (byIdemCalls++ === 0 ? undefined : realByIdem(source, key));
+  ev.events.insert = () => {
+    const err = /** @type {Error & { code: string }} */ (new Error('UNIQUE constraint failed: events.source, events.idem_key'));
+    err.code = 'ERR_SQLITE_ERROR';
+    throw err;
+  };
+  try {
+    const dup = ev.publish({ type: 'order.paid', data: {}, idempotencyKey: 'k1' }, 'shop');
+    assert.deepEqual([dup.duplicate, dup.event.id], [true, concurrentWriter.id], 'caught the forced UNIQUE violation and returned the concurrently-committed event instead of throwing');
+  } finally {
+    ev.events.byIdempotencyKey = realByIdem;
+    ev.events.insert = realInsert;
+  }
+});
