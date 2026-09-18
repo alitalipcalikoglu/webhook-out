@@ -116,6 +116,7 @@ All settings come from environment variables and are validated at startup. See [
 
 ## Security notes
 
+- **At-least-once delivery, not exactly-once.** If the receiver returns `2xx` but this process dies before the delivery's local `succeeded` state commits, the same delivery is retried and the receiver gets the same request again — do not assume the receiver sees each delivery only once. `X-Webhook-Delivery` is the delivery row's own id and stays identical across every retry attempt of that delivery (only `X-Webhook-Attempt` changes); a receiver can use it as an idempotency/deduplication key. A replay (`POST /v1/subscriptions/:id/replay`) or a redeliver (`POST /v1/deliveries/:id/redeliver`) is a deliberate resend, not a retry: it creates a brand-new delivery with its own new `X-Webhook-Delivery`, carrying the same `X-Webhook-Id` (event id) as the original — a receiver that also wants to ignore intentional replays needs to dedupe on `X-Webhook-Id` instead, separately from retry-deduping on `X-Webhook-Delivery`.
 - API keys compared in constant time; per-key rate limit; `publish` keys can only inject events; roles checked before body validation.
 - Subscriber secrets are generated here (`whsec_` + 256 random bits), returned once, sealed with AES-256-GCM under `SECRETS_KEY` and never logged or listed. Rotation keeps the old secret signing for a bounded grace.
 - Subscription headers may not set `Authorization`; provenance is the signature. `X-Webhook-*` names are reserved.
