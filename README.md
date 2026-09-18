@@ -166,6 +166,10 @@ directly; `ecosystem.config.cjs` has the split apps ready to uncomment. An API-o
 
 ## Lease ownership and scaling model
 
+**Scaling class B — single-node stateful**, where "single-node" means one host, not one process: every
+process (however many) shares one SQLite file at `DB_PATH`; there is no shared state across hosts. See
+[docs/READINESS.md](docs/READINESS.md)'s "Scaling model" for the full class table.
+
 Every claimed delivery gets a fencing token (`owner_token`) and a lease (`lease_until`), not just a
 status column. A worker renews the lease every `HEARTBEAT_MS` while a call is in flight
 (`LEASE_MS`, default 30s; `HEARTBEAT_MS`, default 10s — must be well under `LEASE_MS`), so a call
@@ -188,7 +192,7 @@ the full contract.
 Every request gets a `reqId`, either generated or accepted unconditionally from an inbound
 `X-Request-Id` (`requestIdHeader: 'x-request-id'`, matching every other internal-only service on
 this platform). This service does not yet parse or forward the platform's `traceparent` header —
-that is implemented in `gateway` only — and neither of its own outbound calls (subscriber
+that is implemented in `gateway` and `console` — and neither of its own outbound calls (subscriber
 deliveries, audit batches) forwards a request id or trace context onward. `GET /metrics` mixes
 database-backed counts (subscriptions, events, deliveries by status) with in-memory counters that
 reset on restart (delivery outcomes since start, retries, disables). See

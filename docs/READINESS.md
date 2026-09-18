@@ -292,8 +292,8 @@ whatever `X-Request-Id` a caller sends, generating its own only when the header 
 not new to this review; it predates it, and matches every other internal-only service on this
 platform.
 
-It does **not** parse, honour, or forward a `traceparent` header — as of this review's Stage 1,
-`traceparent` propagation is implemented only in `gateway`. Neither of `webhook-out`'s own outbound
+It does **not** parse, honour, or forward a `traceparent` header —
+`traceparent` propagation is implemented in `gateway` and `console` (Stage 10). Neither of `webhook-out`'s own outbound
 call paths forwards a request id or trace context onward: `HttpCaller.call` (deliveries to
 subscribers, `src/net/http-caller.js`) sends only `content-type`, `content-length`, `accept`,
 `user-agent`, the `X-Webhook-*` delivery headers and the HMAC signature — no `X-Request-Id`, no
