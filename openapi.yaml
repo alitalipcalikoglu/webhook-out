@@ -1,0 +1,1642 @@
+openapi: 3.1.0
+info:
+  title: webhook-out
+  version: "1.0.0"
+  description: |
+    Outbound webhooks: subscriptions with event patterns, fan-out on publish, HMAC-signed
+    deliveries with scheduled retries, secret rotation, delivery history.
+
+    ## Authentication and roles
+
+    Every `/v1/*` route and `/metrics` require `Authorization: Bearer <secret>`. Each configured
+    API key carries exactly one role: `read`, `write`, `publish` or `readwrite`. Routes are gated
+    on a *need* (`read`, `write` or `publish`), and a key's role must be in that need's grant list:
+
+    | Need     | Roles that satisfy it              |
+    |----------|-------------------------------------|
+    | `read`   | `read`, `readwrite`                  |
+    | `write`  | `write`, `readwrite`                 |
+    | `publish`| `publish`, `write`, `readwrite`      |
+
+    This lattice is asymmetric and is the most distinctive part of this service's authorization
+    model: a `write` key also satisfies `publish` (it can call `POST /v1/events`), but a
+    `publish`-only key satisfies *only* the `publish` need. It does **not** satisfy `read` or
+    `write`, so a `publish`-only key can call `POST /v1/events` and nothing else in this API — every
+    other route (including plain reads like `GET /v1/subscriptions`) responds `403 FORBIDDEN` to it.
+    A `readwrite` key satisfies every need.
+
+    A missing or unrecognized key gets `401 UNAUTHORIZED`. A recognized key whose role does not
+    satisfy the route's need gets `403 FORBIDDEN`.
+
+    ## Event type and pattern syntax
+
+    An event **type** (as published via `POST /v1/events`) is dot-separated lower-case segments,
+    e.g. `order.paid`.
+
+    A subscription's `events` array holds **patterns**, each one of exactly three legal forms:
+    1. An exact type, e.g. `order.paid` — matches only that type.
+    2. The bare wildcard `*` — matches every type.
+    3. A dot-terminated prefix wildcard, e.g. `order.*` — matches any type that starts with
+       `order.` and is strictly longer than the prefix (so `order.*` matches `order.paid` but not
+       `order.` or `order`). This is not a general glob: `*` may only appear alone or as the final
+       `.*` segment of a pattern, never in the middle or as a partial-segment wildcard.
+
+    ## Delivery status
+
+    A delivery moves through exactly six states: `pending` (queued, not yet due) → `running`
+    (attempt in flight) → either terminal (`succeeded`, `failed`) or `retrying` (attempt failed,
+    another is scheduled) → back to `running`, until it terminates or is `cancelled`. Only
+    `pending` and `retrying` deliveries can be cancelled; a `running` attempt cannot be
+    interrupted through this API.
+
+    ## Re-delivery mechanisms
+
+    Three distinct mechanisms exist and are not interchangeable: automatic **retry** (same
+    delivery id, scheduled backoff, driven by the worker — not reachable through this API
+    directly), operator **redeliver** (`POST /v1/deliveries/{id}/redeliver` — creates a brand-new
+    delivery id for the same event/subscription pair), and operator **replay**
+    (`POST /v1/subscriptions/{id}/replay` — re-queues every matching event in a time window as new
+    deliveries for one subscription).
+servers:
+  - url: /
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: subscriptions
+  - name: events
+  - name: deliveries
+  - name: stats
+  - name: operational
+paths:
+  /health:
+    get:
+      operationId: webhookOut.health.get
+      summary: Liveness probe
+      tags: [operational]
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: Process is up. No dependency check is performed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+              example:
+                status: ok
+
+  /ready:
+    get:
+      operationId: webhookOut.ready.get
+      summary: Readiness probe
+      description: |
+        Checks the database and reports the in-process (or last-heartbeat-seen) worker status.
+        The result is cached for up to 10 seconds.
+      tags: [operational]
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: Ready. `worker` is `"running"` or `"stopped"`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, worker]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+                  worker:
+                    type: string
+                    enum: [running, stopped]
+              example:
+                status: ok
+                worker: running
+        '503':
+          description: Not ready (dependency check failed).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, error]
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+                  error:
+                    type: string
+              example:
+                status: unavailable
+                error: database unreachable
+
+  /v1/info:
+    get:
+      operationId: webhookOut.info.get
+      summary: Service and API contract identification
+      tags: [operational]
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+                properties:
+                  service:
+                    type: string
+                    const: webhook-out
+                  version:
+                    type: string
+                    description: This service's own package.json semver.
+                  apiVersion:
+                    type: string
+                    const: v1
+                  capabilities:
+                    type: array
+                    items:
+                      type: string
+                    description: Static list of always-on capabilities.
+                    example: [replay, rotate, test-delivery, redeliver]
+                  schemaVersion:
+                    type: integer
+                    description: Current database schema version (PRAGMA user_version).
+                  serviceCore:
+                    type: string
+                    description: Version of the shared @atc-web/service-core package actually running.
+
+  /metrics:
+    get:
+      operationId: webhookOut.metrics.get
+      summary: Prometheus metrics
+      description: |
+        Authenticated (`read` need) but, unlike every other `/v1/*` route, **not** subject to this
+        service's own per-key rate limiter — it is registered outside the `/v1` sub-app that the
+        rate-limit plugin wraps, and its path is literally `/metrics`, not `/v1/metrics`.
+      tags: [operational]
+      x-stack-visibility: operational
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP webhook_subscriptions Subscriptions by status.
+                # TYPE webhook_subscriptions gauge
+                webhook_subscriptions{status="active"} 3
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/subscriptions:
+    post:
+      operationId: webhookOut.subscriptions.create
+      summary: Create a subscription
+      description: |
+        Creates a subscription and returns its brand-new signing secret. **The secret is shown
+        only here and in the `rotate` response — it cannot be retrieved again afterward** (only a
+        sealed form is stored).
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSubscriptionBody'
+      responses:
+        '201':
+          description: Created
+          headers:
+            location:
+              schema:
+                type: string
+              description: '`/v1/subscriptions/{id}` of the new subscription.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionWithSecret'
+        '400':
+          description: |
+            One of: `VALIDATION_FAILED` (request body fails the JSON Schema), `INVALID_URL`
+            (target URL rejected by the outbound-target guard — scheme, host or private-network
+            policy), `INVALID_PATTERN` (an `events` entry is not an exact type, `*`, or a
+            `name.*` prefix), `INVALID_HEADER` (a custom header name/value is not allowed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailedEx'
+                invalidUrl:
+                  $ref: '#/components/examples/InvalidUrlEx'
+                invalidPattern:
+                  $ref: '#/components/examples/InvalidPatternEx'
+                invalidHeader:
+                  $ref: '#/components/examples/InvalidHeaderEx'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/SubscriptionExists'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      operationId: webhookOut.subscriptions.list
+      summary: List subscriptions
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 120 }
+          description: Substring match against name, description or URL.
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/SubscriptionStatus' }
+        - name: event
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 120 }
+          description: Only subscriptions whose `events` array contains exactly this pattern string.
+        - name: limit
+          in: query
+          schema: { $ref: '#/components/schemas/Limit' }
+        - name: cursor
+          in: query
+          schema: { type: string, pattern: '^[a-z0-9]+([.\-_][a-z0-9]+)*$', maxLength: 80 }
+          description: Opaque keyset cursor; pass back the previous page's `nextCursor` (a subscription name).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Subscription'
+                  nextCursor:
+                    type: [string, 'null']
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/subscriptions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/SubscriptionId' }
+    get:
+      operationId: webhookOut.subscriptions.get
+      summary: Get a subscription
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subscription]
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    patch:
+      operationId: webhookOut.subscriptions.patch
+      summary: Update a subscription
+      description: |
+        Partial update; at least one field is required. `enabled: true` resumes the subscription
+        (including from the automatic `disabled` state, resetting the consecutive-failure
+        counter); `enabled: false` pauses it.
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchSubscriptionBody'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subscription]
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: |
+            One of: `VALIDATION_FAILED`, `INVALID_URL`, `INVALID_PATTERN`, `INVALID_HEADER` — same
+            meanings as on create.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailedEx'
+                invalidUrl:
+                  $ref: '#/components/examples/InvalidUrlEx'
+                invalidPattern:
+                  $ref: '#/components/examples/InvalidPatternEx'
+                invalidHeader:
+                  $ref: '#/components/examples/InvalidHeaderEx'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '409':
+          description: '`SUBSCRIPTION_EXISTS` — the patched `name` collides with another subscription.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                subscriptionExists:
+                  $ref: '#/components/examples/SubscriptionExistsEx'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    delete:
+      operationId: webhookOut.subscriptions.delete
+      summary: Delete a subscription
+      description: Also deletes, by database cascade, every delivery queued or recorded for it.
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Deleted; no content.
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/subscriptions/{id}/rotate:
+    post:
+      operationId: webhookOut.subscriptions.rotate
+      summary: Rotate a subscription's signing secret
+      description: |
+        Issues a brand-new signing secret immediately. **The plaintext secret is returned only in
+        this response — it is never retrievable again afterward.** The previous secret keeps
+        signing a second, parallel `v1` HMAC signature on outgoing deliveries until
+        `previousValidUntil` (governed by `PREV_SECRET_GRACE_HOURS`; `null` when the grace period
+        is configured to zero), so a receiver can roll its own verification key over without
+        dropping in-flight deliveries.
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subscription, secret, previousValidUntil]
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+                  secret:
+                    $ref: '#/components/schemas/SigningSecret'
+                  previousValidUntil:
+                    type: [string, 'null']
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/subscriptions/{id}/test:
+    post:
+      operationId: webhookOut.subscriptions.test
+      summary: Send a test delivery
+      description: |
+        Queues one synthetic `webhook.test` event for this subscription only, regardless of its
+        event patterns or status (a paused subscription still gets it queued; it is sent once
+        resumed). Async: `202` is a durability guarantee that the delivery is queued, not that it
+        has been attempted yet.
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+      responses:
+        '202':
+          description: Accepted and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [event, delivery]
+                properties:
+                  event: { $ref: '#/components/schemas/Event' }
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/subscriptions/{id}/replay:
+    post:
+      operationId: webhookOut.subscriptions.replay
+      summary: Re-queue events in a time window for this subscription
+      description: |
+        Re-queues every already-published, non-test event in `[from, to)` that matches this
+        subscription's patterns as a brand-new delivery — existing deliveries for those events are
+        untouched, so the receiver will see repeated event ids and must de-duplicate itself.
+        `to` defaults to now. Distinct from `test` (queues one synthetic event) and from automatic
+        retry (reuses the same delivery id) — this always creates new delivery rows, one per
+        matching event, and the response reports only a count, not the events or deliveries
+        themselves.
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [from]
+              properties:
+                from:
+                  $ref: '#/components/schemas/IsoDateTimeString'
+                to:
+                  $ref: '#/components/schemas/IsoDateTimeString'
+      responses:
+        '202':
+          description: Accepted; every matching event has already been queued as a new delivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queued]
+                properties:
+                  queued:
+                    type: integer
+                    minimum: 0
+                    description: Count of newly-queued deliveries, not an array of them.
+              example:
+                queued: 42
+        '400':
+          description: |
+            One of: `VALIDATION_FAILED` (`from`/`to` missing or not an ISO 8601-shaped string per
+            the request schema), `INVALID_RANGE` (`from`/`to` fails `Date.parse`, or `to` is not
+            after `from`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailedEx'
+                invalidRange:
+                  $ref: '#/components/examples/InvalidRangeEx'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/subscriptions/{id}/deliveries:
+    get:
+      operationId: webhookOut.subscriptions.listDeliveries
+      summary: List a subscription's deliveries
+      tags: [subscriptions]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DeliveryStatus' }
+        - name: event
+          in: query
+          schema: { $ref: '#/components/schemas/EventId' }
+        - name: limit
+          in: query
+          schema: { $ref: '#/components/schemas/Limit' }
+        - name: before
+          in: query
+          schema: { $ref: '#/components/schemas/IntIdString' }
+          description: Keyset pagination — the previous page's `nextBefore`.
+        - name: subscription
+          in: query
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+          description: |
+            Accepted by the request schema but ignored: the `{id}` path segment always determines
+            the subscription filter on this route.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SubscriptionNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/events:
+    post:
+      operationId: webhookOut.events.publish
+      summary: Publish an event
+      description: |
+        Inserts the event and fans it out to a `deliveries` row for every currently-active
+        subscription whose patterns match, in the same database transaction as the event insert —
+        a `202` is a durability guarantee for every matching subscriber at the time of publish, not
+        just an ack of receipt.
+
+        With `idempotencyKey`, a repeat publish from the same API key (`source`) and the same key
+        returns the **original** event and queues nothing new: `duplicate: true` and HTTP `200`
+        instead of `202`. `deliveries` in the response is always an integer **count** of the
+        deliveries created (or, for a duplicate, already existing) for this event — never an array
+        of delivery objects.
+      tags: [events]
+      x-stack-visibility: authenticated
+      x-required-role: publish
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [type]
+              properties:
+                type:
+                  $ref: '#/components/schemas/EventType'
+                data:
+                  description: Arbitrary JSON payload, stored and echoed back as-is. Defaults to `null`.
+                idempotencyKey:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        '202':
+          description: New event, accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPublishResult'
+              example:
+                event: { id: evt_1a2b3c4d5e6f7081, type: order.paid, data: { orderId: 42 }, idempotencyKey: null, source: key_publisher, test: false, createdAt: '2026-09-18T10:00:00.000Z' }
+                deliveries: 3
+                duplicate: false
+        '200':
+          description: Idempotent duplicate — the original event is returned; nothing new was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPublishResult'
+              example:
+                event: { id: evt_1a2b3c4d5e6f7081, type: order.paid, data: { orderId: 42 }, idempotencyKey: order-42-paid, source: key_publisher, test: false, createdAt: '2026-09-18T10:00:00.000Z' }
+                deliveries: 3
+                duplicate: true
+        '400':
+          description: One of `VALIDATION_FAILED` or `INVALID_EVENT_TYPE` (`type` is not dot-separated lower-case segments).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailedEx'
+                invalidEventType:
+                  $ref: '#/components/examples/InvalidEventTypeEx'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            `FORBIDDEN` — the presented key's role does not satisfy the `publish` need (i.e. it is
+            not `publish`, `write` or `readwrite`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                forbidden:
+                  $ref: '#/components/examples/ForbiddenEx'
+        '413':
+          $ref: '#/components/responses/EventTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      operationId: webhookOut.events.list
+      summary: List published events
+      description: Newest first; test events (from `test`/`replay`-adjacent synthetic publishes) are excluded.
+      tags: [events]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/EventType' }
+        - name: limit
+          in: query
+          schema: { $ref: '#/components/schemas/Limit' }
+        - name: before
+          in: query
+          schema: { $ref: '#/components/schemas/IntIdString' }
+          description: Keyset pagination on the internal event sequence — the previous page's `nextBefore`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextBefore]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Event'
+                  nextBefore:
+                    type: [string, 'null']
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/events/{id}:
+    get:
+      operationId: webhookOut.events.get
+      summary: Get an event and its deliveries
+      tags: [events]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/EventId' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [event, deliveries]
+                properties:
+                  event: { $ref: '#/components/schemas/Event' }
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Delivery'
+                    description: Every delivery this event ever produced, across all subscriptions.
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/event-types:
+    get:
+      operationId: webhookOut.eventTypes.list
+      summary: List distinct published event types
+      description: Aggregated counts and last-seen time per type, over all non-test events ever published.
+      tags: [events]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [type, count, lastAt]
+                      properties:
+                        type: { type: string }
+                        count: { type: integer, minimum: 0 }
+                        lastAt: { type: string, format: date-time }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/deliveries:
+    get:
+      operationId: webhookOut.deliveries.list
+      summary: List deliveries
+      tags: [deliveries]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DeliveryStatus' }
+        - name: subscription
+          in: query
+          schema: { $ref: '#/components/schemas/SubscriptionId' }
+        - name: event
+          in: query
+          schema: { $ref: '#/components/schemas/EventId' }
+        - name: limit
+          in: query
+          schema: { $ref: '#/components/schemas/Limit' }
+        - name: before
+          in: query
+          schema: { $ref: '#/components/schemas/IntIdString' }
+          description: Keyset pagination — the previous page's `nextBefore`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/deliveries/{id}:
+    get:
+      operationId: webhookOut.deliveries.get
+      summary: Get a delivery
+      tags: [deliveries]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/IntIdString' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delivery]
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/deliveries/{id}/redeliver:
+    post:
+      operationId: webhookOut.deliveries.redeliver
+      summary: Create a fresh delivery of the same event
+      description: |
+        Queues a brand-new delivery (new delivery id, attempt counter reset) of the same event to
+        the same subscription — e.g. after fixing the receiver. The original delivery row is
+        untouched. Distinct from automatic retry (same delivery id) and from `replay` (a whole time
+        window, not one delivery).
+      tags: [deliveries]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/IntIdString' }
+      responses:
+        '202':
+          description: Accepted and queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delivery]
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/deliveries/{id}/cancel:
+    post:
+      operationId: webhookOut.deliveries.cancel
+      summary: Cancel a queued delivery
+      description: Only `pending` and `retrying` deliveries can be cancelled; a `running` attempt cannot be interrupted.
+      tags: [deliveries]
+      x-stack-visibility: authenticated
+      x-required-role: write
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/IntIdString' }
+      responses:
+        '200':
+          description: Cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delivery]
+                properties:
+                  delivery: { $ref: '#/components/schemas/Delivery' }
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '409':
+          $ref: '#/components/responses/DeliveryNotCancellable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/stats:
+    get:
+      operationId: webhookOut.stats.get
+      summary: Aggregate subscription/event/delivery/worker statistics
+      description: '`last24h`/`recentFailures`/`avgDurationMs24h` are computed over a fixed trailing 24-hour window.'
+      tags: [stats]
+      x-stack-visibility: authenticated
+      x-required-role: read
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <secret>`. Each configured key carries one role (`read`, `write`,
+        `publish` or `readwrite`); see the grant-lattice table in the top-level description.
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              description: Present only on some errors (e.g. VALIDATION_FAILED's field-level list).
+
+    SubscriptionId:
+      type: string
+      pattern: '^sub_[0-9a-f]{16}$'
+
+    EventId:
+      type: string
+      pattern: '^evt_[0-9a-f]{16}$'
+
+    IntIdString:
+      type: string
+      pattern: '^[1-9][0-9]{0,15}$'
+      description: A delivery id or event sequence number, as a decimal string (path/query parameters are always strings).
+
+    Limit:
+      type: string
+      pattern: '^([1-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
+      description: Page size, 1-200. Defaults to 50 when omitted.
+
+    IsoDateTimeString:
+      type: string
+      minLength: 20
+      maxLength: 40
+      format: date-time
+
+    SubscriptionStatus:
+      type: string
+      enum: [active, paused, disabled]
+
+    DeliveryStatus:
+      type: string
+      enum: [pending, running, retrying, succeeded, failed, cancelled]
+      description: |
+        Exactly six values. `pending` (queued) → `running` (attempt in flight) → `succeeded` /
+        `failed` (terminal) or `retrying` (scheduled backoff, back to `running` later); `cancelled`
+        from `pending`/`retrying` only. No `skipped` state exists in this service (unlike
+        scheduler's unrelated, 7-value run-status enum).
+
+    EventType:
+      type: string
+      minLength: 1
+      maxLength: 120
+      pattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\.[a-z0-9]+(?:[._-][a-z0-9]+)*)*$'
+      description: Dot-separated lower-case segments, e.g. `order.paid`.
+
+    EventPattern:
+      type: string
+      minLength: 1
+      maxLength: 120
+      pattern: '^(\*|[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\.[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?:\.\*)?)$'
+      description: |
+        One of three legal forms: an exact event type (`order.paid`), the bare wildcard `*`
+        (matches everything), or a dot-terminated prefix wildcard (`order.*`, matches any type
+        strictly longer than `order.` that starts with it). Not a general glob.
+
+    SubscriptionName:
+      type: string
+      pattern: '^[a-z0-9]+([.\-_][a-z0-9]+)*$'
+      maxLength: 80
+
+    SigningSecret:
+      type: string
+      pattern: '^whsec_[A-Za-z0-9_-]{43}$'
+      description: |
+        Plaintext HMAC signing secret. Returned **only** at subscription creation and at
+        `rotate` — it is sealed at rest afterward and cannot be retrieved again through any other
+        endpoint.
+
+    Headers:
+      type: object
+      maxProperties: 10
+      additionalProperties:
+        type: string
+        maxLength: 1024
+      propertyNames:
+        maxLength: 64
+      description: |
+        Custom headers sent with every delivery to this subscription. Names must match
+        `^x-[a-z0-9-]{1,60}$` (case-insensitive, stored lower-cased) and must not start with
+        `x-webhook-` (reserved for this service's own signature/id/timestamp headers). Values must
+        be printable ASCII, up to 1024 characters.
+
+    CreateSubscriptionBody:
+      type: object
+      additionalProperties: false
+      required: [name, url, events]
+      properties:
+        name:
+          $ref: '#/components/schemas/SubscriptionName'
+        url:
+          type: string
+          minLength: 8
+          maxLength: 2048
+          description: Delivery target URL; validated against this service's outbound-target policy (scheme, private-network rules).
+        events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/EventPattern'
+        description:
+          type: string
+          maxLength: 500
+        headers:
+          $ref: '#/components/schemas/Headers'
+        enabled:
+          type: boolean
+          description: 'Default true. `false` creates the subscription already paused.'
+        ordered:
+          type: boolean
+          description: Best-effort in-order delivery for this subscription (at most one in-flight delivery at a time). Default false.
+
+    PatchSubscriptionBody:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          $ref: '#/components/schemas/SubscriptionName'
+        url:
+          type: string
+          minLength: 8
+          maxLength: 2048
+        events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/EventPattern'
+        description:
+          type: string
+          maxLength: 500
+        headers:
+          $ref: '#/components/schemas/Headers'
+        enabled:
+          type: boolean
+          description: 'true resumes (also from `disabled`, resetting the failure counter); false pauses.'
+        ordered:
+          type: boolean
+
+    Subscription:
+      type: object
+      required: [id, name, description, url, events, headers, status, consecutiveFailures, lastDeliveryAt, lastStatus, secretRotatedUntil, createdBy, createdAt, updatedAt, ordered]
+      properties:
+        id:
+          $ref: '#/components/schemas/SubscriptionId'
+        name:
+          type: string
+        description:
+          type: string
+        url:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventPattern'
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        status:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        consecutiveFailures:
+          type: integer
+          minimum: 0
+        lastDeliveryAt:
+          type: [string, 'null']
+          format: date-time
+        lastStatus:
+          type: [string, 'null']
+          enum: [succeeded, failed, null]
+        secretRotatedUntil:
+          type: [string, 'null']
+          format: date-time
+          description: When the previous signing secret stops being accepted (null if no rotation grace is active).
+        createdBy:
+          type: string
+          description: API key id that created this subscription.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        ordered:
+          type: boolean
+
+    SubscriptionWithSecret:
+      type: object
+      required: [subscription, secret]
+      properties:
+        subscription:
+          $ref: '#/components/schemas/Subscription'
+        secret:
+          $ref: '#/components/schemas/SigningSecret'
+
+    Event:
+      type: object
+      required: [id, type, data, idempotencyKey, source, test, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/EventId'
+        type:
+          type: string
+        data:
+          description: Arbitrary JSON payload as published.
+        idempotencyKey:
+          type: [string, 'null']
+        source:
+          type: string
+          description: API key id that published this event.
+        test:
+          type: boolean
+          description: True for a synthetic event created by `POST /v1/subscriptions/{id}/test`.
+        createdAt:
+          type: string
+          format: date-time
+
+    EventPublishResult:
+      type: object
+      required: [event, deliveries, duplicate]
+      properties:
+        event:
+          $ref: '#/components/schemas/Event'
+        deliveries:
+          type: integer
+          minimum: 0
+          description: Count of deliveries created (new publish) or already existing (idempotent duplicate) for this event. An integer count, never an array of delivery objects.
+        duplicate:
+          type: boolean
+          description: True when this call matched an existing `idempotencyKey` from the same API key and returned the original event instead of publishing a new one.
+
+    Attempt:
+      type: object
+      required: [n, startedAt, durationMs, httpStatus, error]
+      properties:
+        n:
+          type: integer
+          minimum: 1
+        startedAt:
+          type: string
+          format: date-time
+        durationMs:
+          type: integer
+          minimum: 0
+        httpStatus:
+          type: [integer, 'null']
+        error:
+          type: [string, 'null']
+
+    Delivery:
+      type: object
+      required: [id, eventId, subscriptionId, status, attempt, maxAttempts, nextAttemptAt, startedAt, finishedAt, durationMs, httpStatus, response, error, attempts, createdAt]
+      properties:
+        id:
+          type: integer
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        subscriptionId:
+          $ref: '#/components/schemas/SubscriptionId'
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+        attempt:
+          type: integer
+          minimum: 0
+          description: Attempts made so far.
+        maxAttempts:
+          type: integer
+          minimum: 1
+          description: 'retryScheduleSec.length + 1, fixed at delivery creation.'
+        nextAttemptAt:
+          type: [string, 'null']
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+        durationMs:
+          type: [integer, 'null']
+        httpStatus:
+          type: [integer, 'null']
+        response:
+          type: [string, 'null']
+          description: Truncated response body of the most recent attempt.
+        error:
+          type: [string, 'null']
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attempt'
+        createdAt:
+          type: string
+          format: date-time
+
+    DeliveryListResponse:
+      type: object
+      required: [items, nextBefore]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Delivery'
+        nextBefore:
+          type: [string, 'null']
+          description: Keyset pagination cursor (a delivery id as a string) — pass as `before` to fetch the next page. `null` on the last page.
+
+    Stats:
+      type: object
+      required: [subscriptions, events, deliveries, worker]
+      properties:
+        subscriptions:
+          type: object
+          required: [active, paused, disabled]
+          properties:
+            active: { type: integer, minimum: 0 }
+            paused: { type: integer, minimum: 0 }
+            disabled: { type: integer, minimum: 0 }
+        events:
+          type: object
+          required: [total, last24h]
+          properties:
+            total: { type: integer, minimum: 0 }
+            last24h: { type: integer, minimum: 0 }
+        deliveries:
+          type: object
+          required: [byStatus, last24h, backlog, avgDurationMs24h, topFailures24h]
+          properties:
+            byStatus:
+              $ref: '#/components/schemas/DeliveryStatusCounts'
+            last24h:
+              $ref: '#/components/schemas/DeliveryStatusCounts'
+            backlog:
+              type: object
+              required: [queued, oldestAt]
+              properties:
+                queued: { type: integer, minimum: 0 }
+                oldestAt: { type: [string, 'null'], format: date-time }
+            avgDurationMs24h:
+              type: [number, 'null']
+            topFailures24h:
+              type: array
+              items:
+                type: object
+                required: [subscriptionId, failed]
+                properties:
+                  subscriptionId:
+                    $ref: '#/components/schemas/SubscriptionId'
+                  failed:
+                    type: integer
+                    minimum: 0
+        worker:
+          type: object
+          required: [running, inFlight, concurrency, sinceStart]
+          properties:
+            running:
+              type: boolean
+            inFlight:
+              type: integer
+              minimum: 0
+            concurrency:
+              type: integer
+              minimum: 1
+            sinceStart:
+              description: |
+                Process-local counters since this process started, or `null` when this process has
+                no in-process worker (API-only role) — a deliberate `null`, not a misleading zero,
+                since this process itself never finished a delivery.
+              oneOf:
+                - type: 'null'
+                - type: object
+                  required: [succeeded, failed, retried, disabled]
+                  properties:
+                    succeeded: { type: integer, minimum: 0 }
+                    failed: { type: integer, minimum: 0 }
+                    retried: { type: integer, minimum: 0 }
+                    disabled: { type: integer, minimum: 0 }
+
+    DeliveryStatusCounts:
+      type: object
+      required: [pending, running, retrying, succeeded, failed, cancelled]
+      properties:
+        pending: { type: integer, minimum: 0 }
+        running: { type: integer, minimum: 0 }
+        retrying: { type: integer, minimum: 0 }
+        succeeded: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        cancelled: { type: integer, minimum: 0 }
+
+  responses:
+    Unauthorized:
+      description: '`UNAUTHORIZED` — missing or unrecognized API key.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/UnauthorizedEx'
+
+    Forbidden:
+      description: '`FORBIDDEN` — the presented key''s role does not satisfy this route''s need.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ForbiddenEx'
+
+    RateLimited:
+      description: '`RATE_LIMITED` — this API key exceeded its per-minute request budget.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/RateLimitedEx'
+
+    ValidationFailed:
+      description: '`VALIDATION_FAILED` — request failed JSON Schema validation (only reachable reason for a 400 at this route).'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            validationFailed:
+              $ref: '#/components/examples/ValidationFailedEx'
+
+    SubscriptionNotFound:
+      description: '`SUBSCRIPTION_NOT_FOUND` — no subscription with this id.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            subscriptionNotFound:
+              $ref: '#/components/examples/SubscriptionNotFoundEx'
+
+    SubscriptionExists:
+      description: '`SUBSCRIPTION_EXISTS` — a subscription with this name already exists.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            subscriptionExists:
+              $ref: '#/components/examples/SubscriptionExistsEx'
+
+    EventNotFound:
+      description: '`EVENT_NOT_FOUND` — no event with this id.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            eventNotFound:
+              $ref: '#/components/examples/EventNotFoundEx'
+
+    DeliveryNotFound:
+      description: '`DELIVERY_NOT_FOUND` — no delivery with this id.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            deliveryNotFound:
+              $ref: '#/components/examples/DeliveryNotFoundEx'
+
+    DeliveryNotCancellable:
+      description: '`DELIVERY_NOT_CANCELLABLE` — the delivery is not `pending` or `retrying` (e.g. already `running` or terminal), so it cannot be cancelled.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            deliveryNotCancellable:
+              $ref: '#/components/examples/DeliveryNotCancellableEx'
+
+    EventTooLarge:
+      description: '`EVENT_TOO_LARGE` — the JSON-encoded `data` exceeds this instance''s configured `MAX_EVENT_BYTES`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            eventTooLarge:
+              $ref: '#/components/examples/EventTooLargeEx'
+
+  examples:
+    ValidationFailedEx:
+      summary: VALIDATION_FAILED
+      value:
+        error:
+          code: VALIDATION_FAILED
+          message: body/name must match pattern "^[a-z0-9]+([.\-_][a-z0-9]+)*$"
+          details:
+            - path: /name
+              message: must match pattern "^[a-z0-9]+([.\-_][a-z0-9]+)*$"
+              params: { pattern: '^[a-z0-9]+([.\-_][a-z0-9]+)*$' }
+    InvalidUrlEx:
+      summary: INVALID_URL
+      value:
+        error:
+          code: INVALID_URL
+          message: target URL must use http or https
+    InvalidPatternEx:
+      summary: INVALID_PATTERN
+      value:
+        error:
+          code: INVALID_PATTERN
+          message: pattern "order.*.paid" must be an event type, a prefix like "order.*" or "*"
+    InvalidHeaderEx:
+      summary: INVALID_HEADER
+      value:
+        error:
+          code: INVALID_HEADER
+          message: header "X-Webhook-Signature" is not allowed; only custom X-* headers can be set
+    InvalidEventTypeEx:
+      summary: INVALID_EVENT_TYPE
+      value:
+        error:
+          code: INVALID_EVENT_TYPE
+          message: event type "Order.Paid" must be dot-separated lower-case segments
+    InvalidRangeEx:
+      summary: INVALID_RANGE
+      value:
+        error:
+          code: INVALID_RANGE
+          message: to must be after from
+    EventTooLargeEx:
+      summary: EVENT_TOO_LARGE
+      value:
+        error:
+          code: EVENT_TOO_LARGE
+          message: event data is 131072 bytes, limit 65536
+    SubscriptionNotFoundEx:
+      summary: SUBSCRIPTION_NOT_FOUND
+      value:
+        error:
+          code: SUBSCRIPTION_NOT_FOUND
+          message: subscription "sub_0000000000000000" not found
+    SubscriptionExistsEx:
+      summary: SUBSCRIPTION_EXISTS
+      value:
+        error:
+          code: SUBSCRIPTION_EXISTS
+          message: subscription "orders-webhook" already exists
+    EventNotFoundEx:
+      summary: EVENT_NOT_FOUND
+      value:
+        error:
+          code: EVENT_NOT_FOUND
+          message: event "evt_0000000000000000" not found
+    DeliveryNotFoundEx:
+      summary: DELIVERY_NOT_FOUND
+      value:
+        error:
+          code: DELIVERY_NOT_FOUND
+          message: delivery 999999 not found
+    DeliveryNotCancellableEx:
+      summary: DELIVERY_NOT_CANCELLABLE
+      value:
+        error:
+          code: DELIVERY_NOT_CANCELLABLE
+          message: delivery 42 is running; only pending and retrying deliveries can be cancelled
+    ForbiddenEx:
+      summary: FORBIDDEN
+      value:
+        error:
+          code: FORBIDDEN
+          message: this API key has no write access
+    UnauthorizedEx:
+      summary: UNAUTHORIZED
+      value:
+        error:
+          code: UNAUTHORIZED
+          message: missing or invalid API key
+    RateLimitedEx:
+      summary: RATE_LIMITED
+      value:
+        error:
+          code: RATE_LIMITED
+          message: rate limit exceeded, retry in 12
