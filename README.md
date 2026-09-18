@@ -192,9 +192,10 @@ the full contract.
 
 Every request gets a `reqId`, either generated or accepted unconditionally from an inbound
 `X-Request-Id` (`requestIdHeader: 'x-request-id'`, matching every other internal-only service on
-this platform). This service does not yet parse or forward the platform's `traceparent` header —
-that is implemented in `gateway` and `console` — and neither of its own outbound calls (subscriber
-deliveries, audit batches) forwards a request id or trace context onward. `GET /metrics` mixes
+this platform), plus `traceId`/`spanId` from an inbound `traceparent`, trusted only when
+`TRUST_PROXY=true` (see [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md)). Neither of this
+service's own outbound calls (subscriber deliveries — external, operator-configured; audit batches
+— deliberately unwired) forwards a request id or trace context onward. `GET /metrics` mixes
 database-backed counts (subscriptions, events, deliveries by status) with in-memory counters that
 reset on restart (delivery outcomes since start, retries, disables). See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.

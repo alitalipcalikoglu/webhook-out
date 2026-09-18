@@ -29,6 +29,10 @@ test('Worker: delivery carries signature, ids, custom headers and the event body
   assert.equal(req.headers['x-webhook-attempt'], '1');
   assert.equal(req.headers['x-webhook-subscription'], sub.id);
   assert.equal(req.headers.authorization, undefined);
+  // Post-production Phase 5 security regression: a subscriber URL is operator-configured
+  // external — never receives platform trace/request-id headers.
+  assert.equal('traceparent' in req.headers, false);
+  assert.equal('x-request-id' in req.headers, false);
   assert.ok(Signer.verify(secret, req.body, String(req.headers['x-webhook-signature']), { now: clock.now() }), 'signature verifies with the subscriber secret against the raw body');
   assert.deepEqual(worker.counters, { succeeded: 1, failed: 0, retried: 0, disabled: 0 });
 });

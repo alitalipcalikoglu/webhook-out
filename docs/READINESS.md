@@ -277,8 +277,8 @@ delivery-specific structured fields on top (`delivery`, `event`, `subscription`,
 `status`, `httpStatus`, `durationMs`, `nextAttemptAt`, `error`) — useful operationally, but outside
 the platform's shared vocabulary in [OBSERVABILITY.md](../../stack/docs/OBSERVABILITY.md).
 
-Against that shared vocabulary, `webhook-out` does **not** yet emit: `traceId` / `spanId` (it does
-not parse `traceparent` at all — see Tracing), a normalised `route`/`op` (only implicit `req.url`),
+Against that shared vocabulary, `webhook-out` does **not** yet emit: a normalised `route`/`op`
+(`traceId`/`spanId` are now emitted — see Tracing; only implicit `req.url`),
 `upstream` / `upstreamMs` for either of its outbound call types (subscriber deliveries, audit
 batches — neither is logged with a labelled upstream/timing field), `service` / `version` (no
 service-identity fields on any log line), or `code` for handled domain errors (`WebhookError`'s
@@ -292,9 +292,12 @@ whatever `X-Request-Id` a caller sends, generating its own only when the header 
 not new to this review; it predates it, and matches every other internal-only service on this
 platform.
 
-It does **not** parse, honour, or forward a `traceparent` header —
-`traceparent` propagation is implemented in `gateway` and `console` (Stage 10). Neither of `webhook-out`'s own outbound
-call paths forwards a request id or trace context onward: `HttpCaller.call` (deliveries to
+It also parses an inbound `traceparent` via `@atc-web/service-core`'s `registerRequestContext`,
+trust-gated on `TRUST_PROXY` (same boundary as `X-Forwarded-*`): trusted, the caller's trace-id is
+continued with a fresh span-id; untrusted or malformed, a fresh trace is started. Both
+`traceId`/`spanId` are logged on every request line. Neither of `webhook-out`'s own outbound
+call paths forwards a request id or trace context onward — both remain external/operator-configured
+or deliberately unwired, see OBSERVABILITY.md's trust model: `HttpCaller.call` (deliveries to
 subscribers, `src/net/http-caller.js`) sends only `content-type`, `content-length`, `accept`,
 `user-agent`, the `X-Webhook-*` delivery headers and the HMAC signature — no `X-Request-Id`, no
 `traceparent`; `AuditClient#send` (`src/net/audit-client.js`) sends only `authorization` and
