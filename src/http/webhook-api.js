@@ -40,8 +40,9 @@ export class WebhookApi {
    * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
+   * @param {() => number} [deps.now]
    */
-  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, presence, worker, db, version, logger }) {
+  constructor({ config, audit, subscriptionService, eventService, subscriptions, events, deliveries, presence, worker, db, version, logger, now = Date.now }) {
     this.config = config;
     this.audit = audit;
     this.subs = subscriptionService;
@@ -54,6 +55,7 @@ export class WebhookApi {
     this.db = db;
     this.version = version;
     this.logger = logger;
+    this.now = now;
     this.auth = new ApiKeyAuth(config.apiKeys);
   }
 
@@ -195,7 +197,7 @@ export class WebhookApi {
   }
 
   #stats() {
-    const now = Date.now();
+    const now = this.now();
     const since = now - WebhookApi.STATS_WINDOW_MS;
     const d = this.deliveries.stats(since);
     return {

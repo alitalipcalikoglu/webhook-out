@@ -141,3 +141,30 @@ test('API: publish, fan-out, idempotency, events, deliveries, test, replay, rede
   assert.match(metrics.body, /webhook_backlog 2\n/);
   assert.match(metrics.body, /webhook_attempts_retried_total 2\n/);
 });
+
+test('API: stats last24h is windowed by the injected clock, not wall time — inclusive at exactly 24h', async (t) => {
+  const rx = await receiver(() => ({ status: 200, body: '{"ok":1}' }));
+  t.after(rx.close);
+  const { app, worker, clock } = await buildApp();
+  t.after(() => app.close());
+  const sub = json(await app.inject({ method: 'POST', url: '/v1/subscriptions', headers: bearer(RW_KEY), payload: { name: 'ok', url: `${rx.url}/ok`, events: ['*'] } })).subscription;
+  await app.inject({ method: 'POST', url: '/v1/events', headers: bearer(PUBLISH_KEY), payload: { type: 'order.paid', data: {} } });
+  await worker.tick();
+  const created = json(await app.inject({ url: `/v1/deliveries?subscription=${sub.id}`, headers: bearer(READ_KEY) })).items[0];
+  assert.equal(created.status, 'succeeded');
+  const createdAt = clock.now();
+
+  let stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.deliveries.last24h.succeeded, 1, 'delivery visible right after it completes');
+
+  // The store's own query is `created_at >= since` (inclusive lower bound) — asserting the real
+  // contract read from `delivery-store.js`, not a guessed one.
+  clock.advance(24 * 3_600_000 - (clock.now() - createdAt));
+  assert.equal(clock.now() - createdAt, 24 * 3_600_000);
+  stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.deliveries.last24h.succeeded, 1, 'exactly 24h old: still included (inclusive >= boundary)');
+
+  clock.advance(1);
+  stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.deliveries.last24h.succeeded, 0, '24h + 1ms old: excluded');
+});

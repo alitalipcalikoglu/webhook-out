@@ -75,7 +75,7 @@ export function testService(overrides) {
   const eventService = new EventService({ db, events, deliveries, subscriptions, options: config, now: clock.now });
   const caller = new HttpCaller({ guard, timeoutMs: config.deliveryTimeoutMs, now: clock.now });
   const worker = new Worker({ events: eventService, subscriptionService, subscriptions, deliveries, eventStore: events, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.eventRetentionDays, disableAfterFailures: config.disableAfterFailures, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: 5_000, subscriptionConcurrencyMax: config.subscriptionConcurrencyMax }, now: clock.now });
-  return { config, clock, db, subscriptions, events, deliveries, presence, guard, box, subscriptionService, eventService, caller, worker };
+  return { config, clock, db, subscriptions, events, deliveries, presence, guard, box, subscriptionService, eventService, caller, worker, now: clock.now };
 }
 
 /** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
