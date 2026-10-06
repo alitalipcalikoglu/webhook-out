@@ -27,6 +27,15 @@ export class WebhookApi {
   static PRESENCE_STALE_FACTOR = 4;
 
   /**
+   * Audit meta for a subscription patch. Custom headers may hold credentials, so only their names
+   * are kept.
+   * @param {Record<string, any>} patch
+   */
+  static auditPatch(patch) {
+    return patch?.headers ? { ...patch, headers: Object.keys(patch.headers) } : patch;
+  }
+
+  /**
    * @param {object} deps
    * @param {Config} deps.config
    * @param {import('../domain/subscription-service.js').SubscriptionService} deps.subscriptionService
@@ -139,7 +148,7 @@ export class WebhookApi {
       return { items: items.map(Views.subscription), nextCursor };
     });
     api.get('/subscriptions/:id', { ...read, schema: { params: Schemas.subParams } }, async (request) => ({ subscription: Views.subscription(this.subs.get(pid(request))) }));
-    api.patch('/subscriptions/:id', { config: { audit: AuditClient.route('webhook.subscription.update', (r) => ({ type: 'subscription', id: /** @type {any} */ (r.params).id }), (r) => ({ patch: r.body })) }, ...write, schema: { params: Schemas.subParams, body: Schemas.patchSubscription } }, async (request) => ({ subscription: Views.subscription(this.subs.update(pid(request), /** @type {any} */ (request.body))) }));
+    api.patch('/subscriptions/:id', { config: { audit: AuditClient.route('webhook.subscription.update', (r) => ({ type: 'subscription', id: /** @type {any} */ (r.params).id }), (r) => ({ patch: WebhookApi.auditPatch(/** @type {any} */ (r.body)) })) }, ...write, schema: { params: Schemas.subParams, body: Schemas.patchSubscription } }, async (request) => ({ subscription: Views.subscription(this.subs.update(pid(request), /** @type {any} */ (request.body))) }));
     api.delete('/subscriptions/:id', { config: { audit: AuditClient.route('webhook.subscription.delete', (r) => ({ type: 'subscription', id: /** @type {any} */ (r.params).id })) }, ...write, schema: { params: Schemas.subParams } }, async (request, reply) => {
       this.subs.remove(pid(request));
       return reply.code(204).send();

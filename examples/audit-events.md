@@ -41,4 +41,4 @@ One event per completed write request, `outcome: "success"` for 2xx, `outcome: "
 }
 ```
 
-`meta` carries the request patch or a summary (counts) where useful; secrets never appear in it. Query the audit service by `source=webhook-out`, `actionPrefix=webhook.` or by target to reconstruct what happened to an entity.
+`meta` carries the request patch or a summary (counts) where useful; secrets never appear in it. For `webhook.subscription.update` custom `headers` are reduced to their names: header values can hold credentials and are not forwarded. Query the audit service by `source=webhook-out`, `actionPrefix=webhook.` or by target to reconstruct what happened to an entity.

@@ -171,3 +171,9 @@ test('API: stats last24h is windowed by the injected clock, not wall time — in
   stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
   assert.equal(stats.deliveries.last24h.succeeded, 0, '24h + 1ms old: excluded');
 });
+
+test('subscription.update audit meta keeps header names only', async () => {
+  const { WebhookApi } = await import('../src/http/webhook-api.js');
+  assert.deepEqual(WebhookApi.auditPatch({ name: 'n', headers: { authorization: 'Bearer sekret' } }), { name: 'n', headers: ['authorization'] });
+  assert.deepEqual(WebhookApi.auditPatch({ enabled: false }), { enabled: false });
+});
